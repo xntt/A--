@@ -27,7 +27,6 @@ def fetch_all_stock_codes():
         response = requests.get(url, params=params, timeout=5)
         data = response.json()
         stocks = data['data']['diff']
-        # 过滤掉北交所和ST股
         valid_stocks = [s for s in stocks if not s['f14'].startswith('ST') and not s['f14'].startswith('*ST')]
         return valid_stocks
     except Exception as e:
@@ -137,11 +136,10 @@ if mode == "🎯 阶段一：全市场海选 (粗筛)":
                     logic_reason = "均线完美多头，温和放量沿5日线上涨"
             
             if is_match:
-                return {"股票代码": code, "股票名称": name, "当前价": latest['Close'], "入选核心逻辑": logic_reason}
+                return {"股票代码": str(code).zfill(6), "股票名称": name, "当前价": latest['Close'], "入选核心逻辑": logic_reason}
             return None
 
-        # ================= 扫描设置 =================
-        # 若要测试，可以改成 test_stocks = all_stocks[:1000]
+        # 如果你想跑全市场，把 all_stocks[:1000] 改成 all_stocks
         test_stocks = all_stocks[:1000] 
         test_total = len(test_stocks)
         
@@ -160,12 +158,10 @@ if mode == "🎯 阶段一：全市场海选 (粗筛)":
         progress_bar.progress(1.0)
         status_text.success(f"✅ 海选完成！共扫出 {len(found_list)} 只基础标的。")
         
-    # === 新增：如果在 session 中有数据，无论是否刚扫完，都提供下载按钮 ===
     if st.session_state.found_stocks:
         df_result = pd.DataFrame(st.session_state.found_stocks)
         st.dataframe(df_result, use_container_width=True)
         
-        # 将 DataFrame 转换为 utf-8-sig 的 CSV（Excel打开不乱码）
         csv_data = df_result.to_csv(index=False).encode('utf-8-sig')
         st.download_button(
             label="💾 下载本次海选结果 (CSV文件)",
@@ -174,19 +170,16 @@ if mode == "🎯 阶段一：全市场海选 (粗筛)":
             mime="text/csv",
             type="primary"
         )
-        st.info("💡 建议下载保存！以后可直接在【阶段二】上传此文件进行打分，无需重新扫描。")
 
 elif mode == "🏆 阶段二：深度过滤与打分 (精选)":
     st.title("🏆 量化多维打分中心")
     st.markdown("基于不同策略的底层逻辑，对基础池进行**动态权重打分**。")
     
-    # === 新增：数据来源选择器 ===
     data_source = st.radio("📂 请选择打分数据来源：", [
         "1️⃣ 使用当前系统刚扫描的缓存数据", 
         "2️⃣ 上传历史下载的海选结果文件 (.csv)"
     ], horizontal=True)
     
-    # 逻辑分发：获取待打分的 DataFrame 和 策略
     df_to_score = pd.DataFrame()
     strategy_for_score = "尚未选择"
     ready_to_score = False
@@ -204,14 +197,19 @@ elif mode == "🏆 阶段二：深度过滤与打分 (精选)":
         uploaded_file = st.file_uploader("📥 请上传阶段一下载的 .csv 文件", type=['csv'])
         if uploaded_file is not None:
             try:
-                df_to_score = pd.read_csv(uploaded_file)
-                # 兼容处理股票代码变成数字（如 1 变成 000001）
+                # 修复核心1：强制 utf-8-sig 解码消除 BOM
+                df_to_score = pd.read_csv(uploaded_file, encoding='utf-8-sig')
+                # 修复核心2：暴力清洗所有的列名，去掉隐藏空格和乱码
+                df_to_score.columns = df_to_score.columns.str.replace('\ufeff', '').str.strip()
+                
                 if '股票代码' in df_to_score.columns:
-                    df_to_score['股票代码'] = df_to_score['股票代码'].apply(lambda x: str(x).zfill(6))
+                    # 修复核心3：防止pandas把 000001 读成浮点数 1.0，强转字符并补齐6位
+                    df_to_score['股票代码'] = df_to_score['股票代码'].astype(str).apply(lambda x: x.split('.')[0].zfill(6))
+                else:
+                    st.error("❌ 文件中未检测到【股票代码】列，请检查文件格式。")
+                    st.stop()
                 
                 st.success(f"文件读取成功！共解析出 {len(df_to_score)} 只标的。")
-                
-                # 重新选择这批数据的策略
                 strategy_for_score = st.selectbox("⚙️ 请选择这批股票原本对应的策略（用于精准匹配打分权重）：", [
                     "趋势低吸", "底部启动", "稳健波段"
                 ])
@@ -220,82 +218,85 @@ elif mode == "🏆 阶段二：深度过滤与打分 (精选)":
                 with st.expander("👀 查看上传的数据", expanded=False):
                     st.dataframe(df_to_score, use_container_width=True)
             except Exception as e:
-                st.error(f"文件解析失败，请确保上传的是阶段一下载的源文件。错误详情：{e}")
+                st.error(f"文件解析失败，错误详情：{e}")
 
     st.markdown("---")
     
-    # === 打分引擎 ===
     if ready_to_score:
         if st.button("🚀 启动多因子深度打分 (智能匹配权重)", type="primary", use_container_width=True):
             scored_stocks = []
+            failed_count = 0  # 记录抓取失败的股票数量
+            
             progress_text = st.empty()
             progress_bar = st.progress(0)
             
-            # 将 DataFrame 转回字典列表便于遍历
             stock_list = df_to_score.to_dict('records')
             total = len(stock_list)
             
             for idx, stock in enumerate(stock_list):
-                code = str(stock.get('股票代码', '')).zfill(6)
+                # 再次确保取出来的值绝对是6位数字符串
+                code = str(stock.get('股票代码', '')).strip().zfill(6)
                 name = stock.get('股票名称', '未知')
                 logic = stock.get('入选核心逻辑', '无')
                 
                 progress_text.text(f"🔬 正在深度剖析: {name} ({code}) ... [{idx+1}/{total}]")
                 hist = fetch_kline_data_tencent(code, days=80) 
                 
-                if not hist.empty and len(hist) > 60:
-                    df = calculate_indicators(hist)
-                    latest = df.iloc[-1]
+                # 如果拉不到数据，记录失败次数并跳过
+                if hist.empty or len(hist) < 60:
+                    failed_count += 1
+                    progress_bar.progress((idx + 1) / total)
+                    continue
                     
-                    # 因子A: RPS 抗跌
-                    price_20d_ago = df.iloc[-20]['Close']
-                    gain_20d = (latest['Close'] - price_20d_ago) / price_20d_ago * 100
-                    rps_score = max(0, min(100, (gain_20d + 10) * 4)) 
-                    
-                    # 因子B: 资金活跃度
-                    vol_ratio = latest['Volume'] / latest['VMA20'] if latest['VMA20'] > 0 else 0
-                    activity_score = max(0, min(100, vol_ratio * 33))
-                    
-                    # 因子C: 股性与连板记忆
-                    limit_up_days = len(df[ (df['Close'] - df['Close'].shift(1))/df['Close'].shift(1) > 0.09 ])
-                    if limit_up_days >= 2: stock_char_score = 100
-                    elif limit_up_days == 1: stock_char_score = 60
-                    else: stock_char_score = 20
-                        
-                    # 因子D: 稳健度
-                    high_low_ratio = df['High'] / df['Low'] - 1
-                    avg_volatility = high_low_ratio.tail(20).mean() * 100
-                    steady_score = max(0, min(100, 100 - (avg_volatility - 3) * 20))
-                    
-                    # 动态权重分配
-                    final_score = 0
-                    if "趋势低吸" in strategy_for_score:
-                        final_score = rps_score * 0.5 + stock_char_score * 0.3 + activity_score * 0.2
-                    elif "底部启动" in strategy_for_score:
-                        final_score = activity_score * 0.6 + stock_char_score * 0.3 + rps_score * 0.1
-                    elif "稳健波段" in strategy_for_score:
-                        final_score = steady_score * 0.5 + rps_score * 0.4 + activity_score * 0.1
-                    else:
-                        final_score = (rps_score + activity_score + stock_char_score) / 3
-
-                    scored_stocks.append({
-                        "代码": code, "名称": name,
-                        "综合总分": round(final_score, 1),
-                        "资金活跃分": round(activity_score, 1),
-                        "趋势抗跌分": round(rps_score, 1),
-                        "股性记忆分": round(stock_char_score, 1),
-                        "入选逻辑": logic
-                    })
+                df = calculate_indicators(hist)
+                latest = df.iloc[-1]
                 
+                price_20d_ago = df.iloc[-20]['Close']
+                gain_20d = (latest['Close'] - price_20d_ago) / price_20d_ago * 100
+                rps_score = max(0, min(100, (gain_20d + 10) * 4)) 
+                
+                vol_ratio = latest['Volume'] / latest['VMA20'] if latest['VMA20'] > 0 else 0
+                activity_score = max(0, min(100, vol_ratio * 33))
+                
+                limit_up_days = len(df[ (df['Close'] - df['Close'].shift(1))/df['Close'].shift(1) > 0.09 ])
+                if limit_up_days >= 2: stock_char_score = 100
+                elif limit_up_days == 1: stock_char_score = 60
+                else: stock_char_score = 20
+                    
+                high_low_ratio = df['High'] / df['Low'] - 1
+                avg_volatility = high_low_ratio.tail(20).mean() * 100
+                steady_score = max(0, min(100, 100 - (avg_volatility - 3) * 20))
+                
+                final_score = 0
+                if "趋势低吸" in strategy_for_score:
+                    final_score = rps_score * 0.5 + stock_char_score * 0.3 + activity_score * 0.2
+                elif "底部启动" in strategy_for_score:
+                    final_score = activity_score * 0.6 + stock_char_score * 0.3 + rps_score * 0.1
+                elif "稳健波段" in strategy_for_score:
+                    final_score = steady_score * 0.5 + rps_score * 0.4 + activity_score * 0.1
+                else:
+                    final_score = (rps_score + activity_score + stock_char_score) / 3
+
+                scored_stocks.append({
+                    "代码": code, "名称": name,
+                    "综合总分": round(final_score, 1),
+                    "资金活跃分": round(activity_score, 1),
+                    "趋势抗跌分": round(rps_score, 1),
+                    "股性记忆分": round(stock_char_score, 1),
+                    "入选逻辑": logic
+                })
+            
                 progress_bar.progress((idx + 1) / total)
                 time.sleep(0.05)
                 
-            progress_text.text("✅ 打分完毕！")
+            progress_text.text("✅ 打分计算结束！")
             
-            # === 展示打分结果 ===
             if scored_stocks:
+                if failed_count > 0:
+                    st.warning(f"⚠️ 提示：其中有 {failed_count} 只股票未能获取到完整K线数据被自动忽略。")
+                    
                 df_scores = pd.DataFrame(scored_stocks).sort_values(by="综合总分", ascending=False).reset_index(drop=True)
-                st.success(f"🎯 提纯完成！Top 10 精华标的如下：")
+                st.success(f"🎯 提纯完成！精华标的如下：")
                 
                 cols = st.columns(3)
                 for i, row in df_scores.head(3).iterrows():
@@ -310,7 +311,7 @@ elif mode == "🏆 阶段二：深度过滤与打分 (精选)":
                 except:
                     st.dataframe(df_scores, use_container_width=True)
             else:
-                st.error("计算异常，未生成有效打分。")
+                st.error(f"❌ 打分全部失败！共处理 {total} 只股票，全部因为网络原因或数据不足跳过。")
 
 elif mode == "🔍 阶段三：个股形态复诊":
     st.title("🔍 个股形态显微镜")
