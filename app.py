@@ -102,7 +102,11 @@ def main():
     st.sidebar.caption("纯 新浪+腾讯 | 支持断点续传")
     st.sidebar.markdown("---")
     
-    mode = st.sidebar.radio("选择工作模式：", ["🎯 全市场潜伏雷达 (核心)", "🔍 个股形态复诊"])
+    mode = st.sidebar.radio("选择工作流阶段：", [
+    "🎯 阶段一：全市场海选 (粗筛)", 
+    "🏆 阶段二：深度过滤与打分 (精选)", 
+    "🔍 阶段三：个股形态复诊"
+])
     
     if mode == "🎯 全市场潜伏雷达 (核心)":
         st.title("🎯 全市场潜伏挖掘引擎")
@@ -256,7 +260,134 @@ def main():
             st.balloons()
             st.success(f"🎉 淘金彻底完成！本次共为你挖掘到 {len(st.session_state.found_stocks)} 只牛股。")
             st.rerun() # 最后刷新一下UI状态隐藏"继续"按钮
+    elif mode == "🏆 阶段二：深度过滤与打分 (精选)":
+        st.title("🏆 量化多维打分中心")
+        st.markdown("基于不同策略的底层逻辑，对粗筛池中的标的进行**动态权重打分**，只选 Top 10 的极品。")
+        
+        if not st.session_state.found_stocks:
+            st.warning("⚠️ 当前缓存池为空！请先去【阶段一】运行全市场扫描，拿到基础名单后再来这里打分。")
+            st.stop()
+            
+        df_found = pd.DataFrame(st.session_state.found_stocks)
+        st.info(f"📂 当前缓存池中共有 **{len(df_found)}** 只待检标的。它们来自策略：**{st.session_state.current_strategy}**")
+        
+        with st.expander("👀 查看原始待检名单", expanded=False):
+            st.dataframe(df_found, use_container_width=True)
+            
+        st.markdown("---")
+        
+        if st.button("🚀 启动多因子深度打分 (智能匹配当前策略权重)", type="primary", use_container_width=True):
+            scored_stocks = []
+            strategy = st.session_state.current_strategy
+            
+            progress_text = st.empty()
+            progress_bar = st.progress(0)
+            total = len(st.session_state.found_stocks)
+            
+            for idx, stock in enumerate(st.session_state.found_stocks):
+                code = str(stock['股票代码']).zfill(6)
+                name = stock['股票名称']
+                progress_text.text(f"🔬 正在深度剖析: {name} ({code}) ... [{idx+1}/{total}]")
+                
+                # 拉取近 60 天的数据用于计算因子
+                hist = fetch_kline_data_tencent(code, days=80) 
+                
+                if not hist.empty and len(hist) > 60:
+                    df = calculate_indicators(hist)
+                    latest = df.iloc[-1]
+                    
+                    # ================= 1. 计算通用因子得分 (满分100) =================
+                    
+                    # 因子A: RPS 抗跌相对强度 (近20日涨幅排名模拟)
+                    price_20d_ago = df.iloc[-20]['Close']
+                    gain_20d = (latest['Close'] - price_20d_ago) / price_20d_ago * 100
+                    # 简单模拟：20天涨15%满分，跌10%为0分
+                    rps_score = max(0, min(100, (gain_20d + 10) * 4)) 
+                    
+                    # 因子B: 资金活跃度 (今日量能对比 20日均量)
+                    vol_ratio = latest['Volume'] / latest['VMA20'] if latest['VMA20'] > 0 else 0
+                    # 简单模拟：放量3倍满分，缩量为极低分
+                    activity_score = max(0, min(100, vol_ratio * 33))
+                    
+                    # 因子C: 股性与连板记忆 (近60天内是否有过 9.5% 以上的涨停)
+                    limit_up_days = len(df[ (df['Close'] - df['Close'].shift(1))/df['Close'].shift(1) > 0.095 ])
+                    # 简单模拟：有过2次以上涨停满分，1次60分，0次20分(底分)
+                    if limit_up_days >= 2: stock_char_score = 100
+                    elif limit_up_days == 1: stock_char_score = 60
+                    else: stock_char_score = 20
+                        
+                    # 因子D: 稳健度 (惩罚高波动，计算真实波幅 ATR 简化版)
+                    high_low_ratio = df['High'] / df['Low'] - 1
+                    avg_volatility = high_low_ratio.tail(20).mean() * 100
+                    # 简单模拟：平均振幅在3%以内满分，超过8% 0分
+                    steady_score = max(0, min(100, 100 - (avg_volatility - 3) * 20))
+                    
+                    # ================= 2. 根据策略进行动态权重分配 =================
+                    final_score = 0
+                    
+                    if "趋势低吸" in strategy:
+                        # 趋势股：抗跌最重要，股性其次
+                        final_score = rps_score * 0.5 + stock_char_score * 0.3 + activity_score * 0.2
+                        
+                    elif "底部启动" in strategy:
+                        # 底部启动：爆发当日量能最重要，必须带涨停基因
+                        final_score = activity_score * 0.6 + stock_char_score * 0.3 + rps_score * 0.1
+                        
+                    elif "稳健波段" in strategy:
+                        # 波段股：稳步推升最重要，不要上蹿下跳
+                        final_score = steady_score * 0.5 + rps_score * 0.4 + activity_score * 0.1
+                    
+                    else: # 兜底平均分配
+                        final_score = (rps_score + activity_score + stock_char_score) / 3
 
+                    # 存入结果列表
+                    scored_stocks.append({
+                        "代码": code,
+                        "名称": name,
+                        "综合总分": round(final_score, 1),
+                        "资金活跃分": round(activity_score, 1),
+                        "趋势抗跌分": round(rps_score, 1),
+                        "股性记忆分": round(stock_char_score, 1),
+                        "入选逻辑": stock['入选核心逻辑']
+                    })
+                
+                progress_bar.progress((idx + 1) / total)
+                time.sleep(0.1) # 保护接口
+                
+            progress_text.text("✅ 打分完毕！正在生成精华战报...")
+            
+            # ================= 3. 结果排序与展示 =================
+            if scored_stocks:
+                df_scores = pd.DataFrame(scored_stocks)
+                # 按综合总分降序排列
+                df_scores = df_scores.sort_values(by="综合总分", ascending=False).reset_index(drop=True)
+                
+                st.success(f"🎯 过滤完成！从 {total} 只初选股中，为你提纯出以下精华标的。")
+                
+                st.subheader("🔥 终极潜伏目标 (Top 10)")
+                
+                # 使用 Streamlit 的列式高亮展示 Top 3
+                top_3 = df_scores.head(3)
+                cols = st.columns(3)
+                for i, row in top_3.iterrows():
+                    with cols[i]:
+                        st.metric(label=f"Top {i+1}: {row['名称']} ({row['代码']})", 
+                                  value=f"{row['综合总分']} 分", 
+                                  delta=f"主力活跃度: {row['资金活跃分']}")
+                        st.caption(f"亮点: {row['入选逻辑']}")
+                
+                st.markdown("---")
+                st.write("📋 **完整打分排行榜**")
+                
+                # 数据框高亮染色：分数越高的越红
+                st.dataframe(
+                    df_scores.style.background_gradient(subset=['综合总分', '资金活跃分', '趋势抗跌分', '股性记忆分'], cmap='YlOrRd'),
+                    use_container_width=True
+                )
+                
+                st.info("💡 建议：记录下综合总分 > 80 分的代码，去【阶段三：个股形态复诊】中查看它们的 K 线图，做最终的买入决定！")
+            else:
+                st.error("数据拉取失败或计算异常，未生成有效打分。")
     elif mode == "🔍 个股形态复诊":
         # ... (保持原样的复诊代码)
         st.title("🔍 个股复诊中心 (含60日生命线)")
