@@ -2,73 +2,57 @@ import streamlit as st
 import pandas as pd
 import requests
 import json
-import re
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import time
+import math
 
-st.set_page_config(page_title="自动化量化雷达 | 腾讯新浪引擎", page_icon="📡", layout="wide")
+st.set_page_config(page_title="量化潜伏雷达 | 全市场扫描版", page_icon="📡", layout="wide")
 
-# ================= 1. 新浪财经引擎：全自动获取股票池 =================
-def get_market_stock_pool_sina(pool_type="活跃股榜"):
-    """
-    使用新浪财经接口获取全市场活跃股票列表（防封禁机制极佳）
-    """
-    if pool_type == "高换手率榜(资金活跃)":
-        sort_by = "turnoverratio" # 按换手率排序
-    elif pool_type == "今日强势涨幅榜":
-        sort_by = "changepercent" # 按涨跌幅排序
-    else:
-        sort_by = "amount"        # 默认按成交额排序
-
-    # 新浪财经节点API：获取沪深A股前150只
-    url = f"http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?page=1&num=150&sort={sort_by}&asc=0&node=hs_a"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    
+# ================= 1. 获取全市场 A 股名单 (带清洗功能) =================
+def get_full_market_pool():
+    """一次性获取全市场5000多只股票，并剔除垃圾股"""
+    # 东方财富全市场A股节点 (沪、深、京)
+    url = "https://82.push2.eastmoney.com/api/qt/clist/get?pn=1&pz=6000&po=1&np=1&fltt=2&invt=2&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f12,f14"
     try:
-        res = requests.get(url, headers=headers, timeout=5).text
-        # 新浪返回的JSON键值没有双引号，Python无法直接解析，需要用正则修复
-        fixed_text = re.sub(r'([{,])\s*([a-zA-Z_0-9]+)\s*:', r'\1"\2":', res)
-        stocks = json.loads(fixed_text)
-        
+        res = requests.get(url, timeout=10).json()
+        stocks = res['data']['diff']
         pool = []
         for s in stocks:
-            # 新浪返回的 symbol 格式如 "sh600519", "sz000858"
-            pool.append({"代码": s.get("symbol", ""), "名称": s.get("name", "未知")})
+            code = s['f12']
+            name = s['f14']
+            # 核心过滤逻辑：不要 ST、*ST、退市整理期
+            if "ST" in name or "退" in name:
+                continue
+            pool.append({"代码": code, "名称": name})
         return pool
     except Exception as e:
-        st.error(f"新浪财经接口请求失败，可能网络波动: {e}")
+        st.error(f"获取全市场名单失败: {e}")
         return []
 
-# ================= 2. 腾讯财经引擎：获取极速 K 线数据 =================
-def fetch_kline_data_tencent(symbol, days=100):
-    """使用腾讯财经接口获取K线数据，极速、稳定且自带前复权"""
+# ================= 2. 腾讯财经 K 线引擎 (前复权) =================
+def fetch_kline_data_tencent(symbol, days=150):
+    """获取K线，至少需要150天数据以计算准确的60日均线"""
     s = str(symbol).strip().lower()
-    
-    # 智能补全腾讯所需的 sh/sz 前缀
     if len(s) == 6 and s.isdigit():
-        s = 'sh' + s if s.startswith('6') else 'sz' + s
+        # 简单区分沪深京 (京股8或4开头，简单归入沪深处理逻辑或忽略，腾讯对bj前缀支持有限，这里兼容sh/sz)
+        if s.startswith('6'): s = 'sh' + s
+        elif s.startswith('8') or s.startswith('4'): s = 'bj' + s
+        else: s = 'sz' + s
         
-    # 腾讯K线接口: qfq 代表前复权，保证均线计算准确
     url = f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={s},day,,,{days},qfq"
     headers = {"User-Agent": "Mozilla/5.0"}
     
     try:
         res = requests.get(url, headers=headers, timeout=5).json()
         if res.get("code") != 0 or s not in res.get("data", {}):
-            return pd.DataFrame(), s
+            return pd.DataFrame()
             
         stock_data = res["data"][s]
-        # 优先获取 qfqday(前复权数据), 否则获取 day(未复权数据)
         klines = stock_data.get("qfqday", stock_data.get("day", []))
         
-        # 腾讯自带的 qt 字段里含有最新股票名称
-        qt_info = stock_data.get("qt", {}).get(s, [])
-        name = qt_info[1] if len(qt_info) > 1 else symbol
-
         data = []
         for k in klines:
-            # 腾讯K线数组结构: [日期, 开盘, 收盘, 最高, 最低, 成交量]
             data.append({
                 "Date": k[0], "Open": float(k[1]), "Close": float(k[2]),
                 "High": float(k[3]), "Low": float(k[4]), "Volume": float(k[5])
@@ -77,82 +61,109 @@ def fetch_kline_data_tencent(symbol, days=100):
         df = pd.DataFrame(data)
         df['Date'] = pd.to_datetime(df['Date'])
         df.set_index('Date', inplace=True)
-        return df, name
+        return df
     except Exception:
-        return pd.DataFrame(), s
+        return pd.DataFrame()
 
-# ================= 3. 技术指标算法 =================
+# ================= 3. 专业技术指标与策略计算 =================
 def calculate_indicators(df):
+    # 均线系统
     df['MA20'] = df['Close'].rolling(window=20).mean()
-    df['MA50'] = df['Close'].rolling(window=50).mean()
+    df['MA60'] = df['Close'].rolling(window=60).mean()
     
+    # 成交量均线
+    df['VMA5'] = df['Volume'].rolling(window=5).mean()
+    df['VMA20'] = df['Volume'].rolling(window=20).mean()
+    
+    # MACD系统
     df['EMA12'] = df['Close'].ewm(span=12, adjust=False).mean()
     df['EMA26'] = df['Close'].ewm(span=26, adjust=False).mean()
     df['MACD'] = df['EMA12'] - df['EMA26']
     df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
     
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss.replace(0, 1e-5)
-    df['RSI'] = 100 - (100 / (1 + rs))
     return df
 
-# ================= 4. K线绘图引擎 =================
+# ================= 4. 个股绘图引擎 =================
 def plot_stock_chart(df, name):
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
     fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='K线'), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df['MA20'], line=dict(color='orange', width=1.5), name='MA20'), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df['MA50'], line=dict(color='blue', width=1.5), name='MA50'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['MA60'], line=dict(color='blue', width=1.5), name='MA60(生命线)'), row=1, col=1)
     colors = ['red' if row['Close'] >= row['Open'] else 'green' for index, row in df.iterrows()]
     fig.add_trace(go.Bar(x=df.index, y=df['Volume'], marker_color=colors, name='成交量'), row=2, col=1)
-    fig.update_layout(title=f"{name} 走势分析图", yaxis_title='价格', xaxis_rangeslider_visible=False, height=500, margin=dict(l=0, r=0, t=40, b=0))
+    fig.update_layout(title=f"{name} 走势诊断图", yaxis_title='价格', xaxis_rangeslider_visible=False, height=500, margin=dict(l=0, r=0, t=40, b=0))
     return fig
 
-# ================= 5. 主程序界面逻辑 =================
+# ================= 5. 主程序与 UI =================
 def main():
-    st.sidebar.title("📡 自动化挖掘雷达")
-    st.sidebar.caption("底层引擎：腾讯财经 + 新浪财经 (防屏蔽极速版)")
+    st.sidebar.title("📡 量化潜伏雷达")
+    st.sidebar.caption("全市场慢速扫描引擎 (杜绝追高，专做潜伏)")
     st.sidebar.markdown("---")
     
-    mode = st.sidebar.radio("选择工作模式：", ["🎯 全网自动盲扫挖掘", "🔍 单只个股详细体检"])
+    mode = st.sidebar.radio("选择工作模式：", ["🎯 全市场潜伏雷达 (核心)", "🔍 个股形态复诊"])
     
-    if mode == "🎯 全网自动盲扫挖掘":
-        st.title("🎯 潜力金股全自动挖掘机")
-        st.markdown("系统将自动从新浪财经获取当前A股最具活力的 150 只股票，并利用腾讯算法找出符合你策略的【潜力标的】。")
+    if mode == "🎯 全市场潜伏雷达 (核心)":
+        st.title("🎯 全市场潜伏挖掘引擎")
+        st.markdown("""
+        **逻辑说明**：不再扫涨幅榜去接盘！本雷达将遍历A股5000多只股票，寻找**主力洗盘结束点**或**底部刚启动**的标的。
+        为防封禁，每次请求间隔 0.5 秒。建议在盘后喝茶时间运行全市场扫描。
+        """)
         
         c1, c2 = st.columns(2)
         with c1:
-            pool_choice = st.selectbox("1. 设定扫描雷达的搜索范围：", ["高换手率榜(资金活跃)", "今日强势涨幅榜", "大盘成交活跃榜"])
+            scan_scope = st.selectbox("1. 扫描范围 (耗时预估)：", [
+                "快速试运行 (随机抽100只，约 1 分钟)",
+                "全市场盲扫 (约 5000只，需 40 分钟) - 推荐"
+            ])
         with c2:
-            strategy = st.selectbox("2. 设定选股过滤策略：", [
-                "MACD底部刚刚金叉 (启动信号)", 
-                "均线多头排列且站上MA20 (趋势向上)", 
-                "RSI极度超卖跌破30 (恐慌抄底)"
+            strategy = st.selectbox("2. 核心潜伏策略：", [
+                "【趋势低吸】60日线向上，缩量回踩20日线附近", 
+                "【底部启动】长期横盘，今日放量长阳突破60日线", 
+                "【稳健波段】股价在20日线上，MACD零轴附近刚金叉"
             ])
             
-        if st.button(f"🚀 立即启动全网扫描", type="primary", use_container_width=True):
-            st.info(f"正在接通新浪财经，获取【{pool_choice}】最新名单...")
-            market_stocks = get_market_stock_pool_sina(pool_choice)
+        if st.button("🚀 启动全市场雷达", type="primary", use_container_width=True):
+            st.info("📡 正在获取全市场 A 股名单并清洗垃圾股 (ST/退市)...")
+            market_stocks = get_full_market_pool()
             
             if not market_stocks:
-                st.error("数据获取失败，请重试。")
                 return
                 
-            st.success(f"✅ 成功锁定 {len(market_stocks)} 只活跃股票！正在接通腾讯云端算法进行穿透扫描...")
+            if "快速试运行" in scan_scope:
+                market_stocks = market_stocks[:100] # 只取前100个测试
+                
+            total_stocks = len(market_stocks)
+            st.success(f"✅ 名单获取完毕，共 {total_stocks} 只标的进入雷达锁定。开始慢速穿透扫描...")
             
+            # UI 元素占位
             progress_bar = st.progress(0)
             status_text = st.empty()
+            time_text = st.empty()
+            result_placeholder = st.empty()
+            
             found_stocks = []
+            start_time = time.time()
             
             for i, stock in enumerate(market_stocks):
                 code = stock['代码']
                 name = stock['名称']
-                status_text.text(f"雷达正在扫描: {name} ({code}) ... [进度 {i+1}/{len(market_stocks)}]")
                 
-                # 请求腾讯接口
-                hist, _ = fetch_kline_data_tencent(code, days=60)
-                if not hist.empty and len(hist) >= 50:
+                # 计算耗时与 ETA
+                elapsed_time = time.time() - start_time
+                if i > 0:
+                    eta_seconds = (elapsed_time / i) * (total_stocks - i)
+                    eta_mins = math.ceil(eta_seconds / 60)
+                else:
+                    eta_mins = "?"
+                    
+                status_text.text(f"🔍 正在扫描: {name} ({code}) ... [进度 {i+1}/{total_stocks}]")
+                time_text.caption(f"⏱️ 已耗时: {math.ceil(elapsed_time/60)} 分钟 | 预计还需: {eta_mins} 分钟")
+                
+                # 拉取数据
+                hist = fetch_kline_data_tencent(code)
+                
+                # 数据合规性检查 (上市必须大于 60 天才能算 MA60)
+                if not hist.empty and len(hist) > 65:
                     hist = calculate_indicators(hist)
                     latest = hist.iloc[-1]
                     prev = hist.iloc[-2]
@@ -160,74 +171,98 @@ def main():
                     is_match = False
                     reason = ""
                     
-                    if strategy == "MACD底部刚刚金叉 (启动信号)":
-                        if latest['MACD'] > latest['Signal'] and prev['MACD'] <= prev['Signal'] and latest['MACD'] < 0:
-                            is_match, reason = "水下MACD今日金叉"
-                            
-                    elif strategy == "均线多头排列且站上MA20 (趋势向上)":
-                        if latest['Close'] > latest['MA20'] and latest['MA20'] > latest['MA50'] and latest['MA20'] > prev['MA20']:
-                            is_match, reason = "站上20日线且发散向上"
-                            
-                    elif strategy == "RSI极度超卖跌破30 (恐慌抄底)":
-                        if latest['RSI'] < 30:
-                            is_match, reason = f"RSI极低: {latest['RSI']:.1f}"
+                    # =============== 核心量化策略引擎 ===============
+                    
+                    # 策略1: 趋势缩量回踩 (做上升趋势的洗盘结束点)
+                    if strategy == "【趋势低吸】60日线向上，缩量回踩20日线附近":
+                        ma60_up = latest['MA60'] > prev['MA60'] # 60日线向上
+                        ma20_above_60 = latest['MA20'] > latest['MA60'] # 20日线在60日线上方
+                        price_near_ma20 = abs(latest['Close'] - latest['MA20']) / latest['MA20'] < 0.02 # 股价在20日线上下2%以内
+                        volume_shrink = latest['Volume'] < latest['VMA5'] # 今日成交量小于5日均量
+                        
+                        if ma60_up and ma20_above_60 and price_near_ma20 and volume_shrink:
+                            is_match, reason = True, f"偏离MA20仅 {(abs(latest['Close'] - latest['MA20']) / latest['MA20']*100):.1f}% 且缩量"
 
+                    # 策略2: 底部启动放量突破 (做长期横盘后的第一根大阳线)
+                    elif strategy == "【底部启动】长期横盘，今日放量长阳突破60日线":
+                        breakout = prev['Close'] < prev['MA60'] and latest['Close'] > latest['MA60'] # 昨天在水下，今天穿头
+                        big_yang = latest['Close'] > latest['Open'] * 1.03 # 实体涨幅大于3%
+                        volume_surge = latest['Volume'] > latest['VMA20'] * 2 # 成交量是20日均量的2倍以上
+                        
+                        if breakout and big_yang and volume_surge:
+                            is_match, reason = True, "底部放巨量过60日生命线"
+
+                    # 策略3: 稳健波段起点 (MACD在水面附近刚刚金叉)
+                    elif strategy == "【稳健波段】股价在20日线上，MACD零轴附近刚金叉":
+                        price_ok = latest['Close'] > latest['MA20'] # 保证不在极度弱势
+                        # MACD在零轴附近 (相对值在正负1%以内)
+                        near_zero = abs(latest['MACD']) / latest['Close'] * 100 < 1.0 
+                        just_cross = prev['MACD'] <= prev['Signal'] and latest['MACD'] > latest['Signal'] # 刚刚金叉
+                        
+                        if price_ok and near_zero and just_cross:
+                            is_match, reason = True, "水面(零轴)MACD初次金叉"
+
+                    # 记录金股
                     if is_match:
                         found_stocks.append({
-                            "股票代码": code.replace('sh', '').replace('sz', ''),
+                            "股票代码": code,
                             "股票名称": name,
-                            "最新收盘价": round(latest['Close'], 2),
-                            "入选核心原因": reason
+                            "最新价格": round(latest['Close'], 2),
+                            "入选核心逻辑": reason
                         })
+                        # 每发现一只，立刻实时更新展示表格
+                        result_placeholder.dataframe(pd.DataFrame(found_stocks), use_container_width=True)
                 
-                progress_bar.progress((i + 1) / len(market_stocks))
-                time.sleep(0.05) # 稍微停顿，防止把腾讯接口打崩
+                # 更新进度条
+                progress_bar.progress((i + 1) / total_stocks)
                 
-            status_text.text("✅ 雷达深度扫描完成！")
+                # 核心防封锁机制：强制睡眠 0.4 秒 (模拟真人浏览)
+                time.sleep(0.4)
+                
+            status_text.text("✅ 全市场扫描任务圆满结束！")
+            time_text.empty()
             
             if found_stocks:
-                st.success(f"🎉 挖掘成功！为您找出 {len(found_stocks)} 只符合【{strategy}】的潜力股：")
-                st.dataframe(pd.DataFrame(found_stocks), use_container_width=True)
                 st.balloons()
+                st.success(f"🎉 淘金完成！在 {total_stocks} 只股票中，为你潜伏挖掘到 {len(found_stocks)} 只符合【{strategy}】形态的准牛股。请去同花顺重点加入自选观察！")
             else:
-                st.warning("当前这批市场活跃股中，暂无符合该苛刻策略的股票。建议换个策略或换个榜单盲扫。")
+                st.warning("太苛刻了！今天全市场居然没有一只股票完美符合该策略的潜伏条件。说明今天大盘环境可能不适合该策略，建议空仓观望或更换策略。")
 
-    elif mode == "🔍 单只个股详细体检":
-        st.title("🔍 个股详细体检中心")
-        st.markdown("在这里输入你在雷达里扫描出来的六位数字代码，即可查看详细腾讯 K 线图。")
+
+    elif mode == "🔍 个股形态复诊":
+        st.title("🔍 个股复诊中心 (含60日生命线)")
+        st.markdown("将雷达扫出来的代码输入到这里，验证其技术形态是否真的符合你的眼缘。")
         
         col1, col2 = st.columns([3, 1])
         with col1:
-            t_input = st.text_input("请输入股票代码 (如 600519, 000858):", "600519")
+            t_input = st.text_input("请输入 6 位纯数字代码 (如 600519):", "000001")
         with col2:
             st.write(""); st.write("")
-            btn = st.button("查看腾讯图表", type="primary", use_container_width=True)
+            btn = st.button("查看个股诊断图", type="primary", use_container_width=True)
             
         if btn and t_input.strip():
             symbol = t_input.strip()
-            with st.spinner('正在从腾讯主干网络拉取数据...'):
-                hist, name = fetch_kline_data_tencent(symbol)
+            with st.spinner('正在从云端拉取深度数据...'):
+                hist = fetch_kline_data_tencent(symbol)
                 
-                if hist.empty:
-                    st.error(f"❌ 查无此股，或该股已停牌 (代码: {symbol})。请确认输入的是6位数字A股代码。")
+                if hist.empty or len(hist) < 65:
+                    st.error(f"❌ 查无此股，或该股上市不足 60 天无足够数据。")
                 else:
                     hist = calculate_indicators(hist)
                     latest = hist.iloc[-1]
                     
-                    st.success(f"✅ 成功生成【{name} ({symbol})】的诊断报告")
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("最新价格", f"¥ {latest['Close']:.2f}")
-                    c2.metric("20日均线 (MA20)", f"¥ {latest['MA20']:.2f}")
-                    c3.metric("RSI (14日情绪)", f"{latest['RSI']:.1f}")
+                    st.success(f"✅ 成功生成【代码: {symbol}】的诊断报告")
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("最新价", f"¥ {latest['Close']:.2f}")
+                    c2.metric("20日线 (波段线)", f"¥ {latest['MA20']:.2f}")
+                    c3.metric("60日线 (生命线)", f"¥ {latest['MA60']:.2f}")
                     
-                    st.plotly_chart(plot_stock_chart(hist, name), use_container_width=True)
+                    vol_ratio = latest['Volume'] / latest['VMA5']
+                    c4.metric("今日量能比", f"{vol_ratio:.1f} 倍", 
+                              delta="放量" if vol_ratio > 1 else "缩量", 
+                              delta_color="normal" if vol_ratio > 1 else "inverse")
                     
-                    if latest['Close'] > latest['MA20'] and latest['MACD'] > latest['Signal']:
-                        st.info("💡 **系统评价**：该股处于多头强势区间，MACD金叉向好，具备较好的动能。")
-                    elif latest['Close'] < latest['MA20']:
-                        st.warning("💡 **系统评价**：该股受制于20日均线压制，属于弱势震荡或下跌趋势，请谨慎入场。")
-                    else:
-                        st.info("💡 **系统评价**：该股目前趋势处于过渡期，多空博弈中，建议继续观望。")
+                    st.plotly_chart(plot_stock_chart(hist, f"个股 {symbol}"), use_container_width=True)
 
 if __name__ == "__main__":
     main()
