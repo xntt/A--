@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import requests
 import json
+import re
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import time
@@ -9,35 +10,48 @@ import math
 
 st.set_page_config(page_title="量化潜伏雷达 | 全市场扫描版", page_icon="📡", layout="wide")
 
-# ================= 1. 获取全市场 A 股名单 (带清洗功能) =================
+# ================= 1. 新浪财经引擎：获取全市场 A 股名单 =================
 def get_full_market_pool():
-    """一次性获取全市场5000多只股票，并剔除垃圾股"""
-    # 东方财富全市场A股节点 (沪、深、京)
-    url = "https://82.push2.eastmoney.com/api/qt/clist/get?pn=1&pz=6000&po=1&np=1&fltt=2&invt=2&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f12,f14"
-    try:
-        res = requests.get(url, timeout=10).json()
-        stocks = res['data']['diff']
-        pool = []
-        for s in stocks:
-            code = s['f12']
-            name = s['f14']
-            # 核心过滤逻辑：不要 ST、*ST、退市整理期
-            if "ST" in name or "退" in name:
-                continue
-            pool.append({"代码": code, "名称": name})
-        return pool
-    except Exception as e:
-        st.error(f"获取全市场名单失败: {e}")
-        return []
+    """使用新浪财经接口，一页一页翻取全市场A股名单，绝对防封禁"""
+    pool = []
+    # 沪深A股总数大概在 5100 只左右，每页 100 只，大概需要翻 55 页
+    # 设定最大翻页为 65 页，遇到空数据自动停止
+    for page in range(1, 65):
+        url = f"http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?page={page}&num=100&sort=symbol&asc=1&node=hs_a"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        try:
+            res = requests.get(url, headers=headers, timeout=5).text
+            if not res or res == 'null' or res == '[]':
+                break # 翻到最后一页了，跳出循环
+                
+            # 新浪返回的JSON键值没有双引号，Python无法直接解析，需要用正则修复
+            fixed_text = re.sub(r'([{,])\s*([a-zA-Z_0-9]+)\s*:', r'\1"\2":', res)
+            stocks = json.loads(fixed_text)
+            
+            if not stocks:
+                break
+                
+            for s in stocks:
+                code = s.get("symbol", "")  # 格式如 sh600000, sz000001
+                name = s.get("name", "未知")
+                # 核心过滤逻辑：不要 ST、*ST、退市整理期股票
+                if "ST" in name or "退" in name:
+                    continue
+                pool.append({"代码": code, "名称": name})
+                
+        except Exception as e:
+            # 容错处理：如果某一页网络卡顿，忽略当前页继续
+            continue
+            
+    return pool
 
-# ================= 2. 腾讯财经 K 线引擎 (前复权) =================
+# ================= 2. 腾讯财经引擎：获取极速 K 线 (自带前复权) =================
 def fetch_kline_data_tencent(symbol, days=150):
     """获取K线，至少需要150天数据以计算准确的60日均线"""
     s = str(symbol).strip().lower()
+    # 兼容处理：如果只输入了6位数字，自动加上sh/sz前缀
     if len(s) == 6 and s.isdigit():
-        # 简单区分沪深京 (京股8或4开头，简单归入沪深处理逻辑或忽略，腾讯对bj前缀支持有限，这里兼容sh/sz)
         if s.startswith('6'): s = 'sh' + s
-        elif s.startswith('8') or s.startswith('4'): s = 'bj' + s
         else: s = 'sz' + s
         
     url = f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={s},day,,,{days},qfq"
@@ -91,13 +105,13 @@ def plot_stock_chart(df, name):
     fig.add_trace(go.Scatter(x=df.index, y=df['MA60'], line=dict(color='blue', width=1.5), name='MA60(生命线)'), row=1, col=1)
     colors = ['red' if row['Close'] >= row['Open'] else 'green' for index, row in df.iterrows()]
     fig.add_trace(go.Bar(x=df.index, y=df['Volume'], marker_color=colors, name='成交量'), row=2, col=1)
-    fig.update_layout(title=f"{name} 走势诊断图", yaxis_title='价格', xaxis_rangeslider_visible=False, height=500, margin=dict(l=0, r=0, t=40, b=0))
+    fig.update_layout(title=f"个股 {name} 走势诊断图", yaxis_title='价格', xaxis_rangeslider_visible=False, height=500, margin=dict(l=0, r=0, t=40, b=0))
     return fig
 
 # ================= 5. 主程序与 UI =================
 def main():
     st.sidebar.title("📡 量化潜伏雷达")
-    st.sidebar.caption("全市场慢速扫描引擎 (杜绝追高，专做潜伏)")
+    st.sidebar.caption("纯 新浪+腾讯 慢速扫描引擎")
     st.sidebar.markdown("---")
     
     mode = st.sidebar.radio("选择工作模式：", ["🎯 全市场潜伏雷达 (核心)", "🔍 个股形态复诊"])
@@ -105,15 +119,15 @@ def main():
     if mode == "🎯 全市场潜伏雷达 (核心)":
         st.title("🎯 全市场潜伏挖掘引擎")
         st.markdown("""
-        **逻辑说明**：不再扫涨幅榜去接盘！本雷达将遍历A股5000多只股票，寻找**主力洗盘结束点**或**底部刚启动**的标的。
-        为防封禁，每次请求间隔 0.5 秒。建议在盘后喝茶时间运行全市场扫描。
+        **逻辑说明**：利用【新浪】获取全网名单，利用【腾讯】计算个股形态。  
+        寻找**主力洗盘结束点**或**底部刚启动**的标的。建议选用全市场模式挂机运行。
         """)
         
         c1, c2 = st.columns(2)
         with c1:
             scan_scope = st.selectbox("1. 扫描范围 (耗时预估)：", [
                 "快速试运行 (随机抽100只，约 1 分钟)",
-                "全市场盲扫 (约 5000只，需 40 分钟) - 推荐"
+                "全市场盲扫 (约 5000只，需 30~40 分钟) - 推荐"
             ])
         with c2:
             strategy = st.selectbox("2. 核心潜伏策略：", [
@@ -123,17 +137,19 @@ def main():
             ])
             
         if st.button("🚀 启动全市场雷达", type="primary", use_container_width=True):
-            st.info("📡 正在获取全市场 A 股名单并清洗垃圾股 (ST/退市)...")
-            market_stocks = get_full_market_pool()
+            
+            with st.spinner("📡 正在呼叫新浪财经，一页页翻取全市场 A 股名单并清洗垃圾股 (大概需要5~10秒)..."):
+                market_stocks = get_full_market_pool()
             
             if not market_stocks:
+                st.error("数据拉取失败，请检查网络或重试。")
                 return
                 
             if "快速试运行" in scan_scope:
                 market_stocks = market_stocks[:100] # 只取前100个测试
                 
             total_stocks = len(market_stocks)
-            st.success(f"✅ 名单获取完毕，共 {total_stocks} 只标的进入雷达锁定。开始慢速穿透扫描...")
+            st.success(f"✅ 名单获取完毕，共成功锁定 {total_stocks} 只标的。开始接通腾讯云端穿透扫描...")
             
             # UI 元素占位
             progress_bar = st.progress(0)
@@ -159,7 +175,7 @@ def main():
                 status_text.text(f"🔍 正在扫描: {name} ({code}) ... [进度 {i+1}/{total_stocks}]")
                 time_text.caption(f"⏱️ 已耗时: {math.ceil(elapsed_time/60)} 分钟 | 预计还需: {eta_mins} 分钟")
                 
-                # 拉取数据
+                # 拉取数据 (腾讯)
                 hist = fetch_kline_data_tencent(code)
                 
                 # 数据合规性检查 (上市必须大于 60 天才能算 MA60)
@@ -204,8 +220,10 @@ def main():
 
                     # 记录金股
                     if is_match:
+                        # 把代码前缀sh/sz去掉，方便用户去同花顺搜
+                        clean_code = code.replace("sh", "").replace("sz", "")
                         found_stocks.append({
-                            "股票代码": code,
+                            "股票代码": clean_code,
                             "股票名称": name,
                             "最新价格": round(latest['Close'], 2),
                             "入选核心逻辑": reason
@@ -216,7 +234,7 @@ def main():
                 # 更新进度条
                 progress_bar.progress((i + 1) / total_stocks)
                 
-                # 核心防封锁机制：强制睡眠 0.4 秒 (模拟真人浏览)
+                # 核心防封锁机制：强制睡眠 0.4 秒 (给腾讯服务器喘息时间)
                 time.sleep(0.4)
                 
             status_text.text("✅ 全市场扫描任务圆满结束！")
@@ -242,7 +260,7 @@ def main():
             
         if btn and t_input.strip():
             symbol = t_input.strip()
-            with st.spinner('正在从云端拉取深度数据...'):
+            with st.spinner('正在从腾讯云端拉取深度数据...'):
                 hist = fetch_kline_data_tencent(symbol)
                 
                 if hist.empty or len(hist) < 65:
@@ -262,7 +280,7 @@ def main():
                               delta="放量" if vol_ratio > 1 else "缩量", 
                               delta_color="normal" if vol_ratio > 1 else "inverse")
                     
-                    st.plotly_chart(plot_stock_chart(hist, f"个股 {symbol}"), use_container_width=True)
+                    st.plotly_chart(plot_stock_chart(hist, symbol), use_container_width=True)
 
 if __name__ == "__main__":
     main()
