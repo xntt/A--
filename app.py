@@ -120,7 +120,7 @@ def analyze_single_stock(ticker_symbol):
                 st.success("★★★★★ **综合评级：强烈看多**。均线、MACD与RSI形成多头共振，且未严重超买，建议顺势积极做多。")
             elif close < ma20 and macd < signal:
                 st.error("☆☆☆☆☆ **综合评级：看空观望**。多项指标走坏，处于明确下跌趋势，建议空仓或防守。")
-            elif close > ma20 but macd < signal:
+            elif close > ma20 and macd < signal:  # 【修复点】这里把 but 改成了正确的 and
                 st.warning("★★★☆☆ **综合评级：谨慎持有**。虽然价格在均线上方，但MACD动能不足（背离或死叉），谨防冲高回落。")
             else:
                 st.info("★★☆☆☆ **综合评级：震荡等待**。多空信号不一致，建议等待更明确的突破信号再做决策。")
@@ -199,33 +199,4 @@ def main():
     if mode == "🔍 A股深度诊断":
         st.header("🔍 个股深度诊断 (均线+MACD+RSI+量能)")
         # 默认改为 A股 贵州茅台
-        ticker_input = st.text_input("请输入单只股票代码 (如: 600519.SS):", "600519.SS")
-        
-        if st.button("开始诊断", type="primary"):
-            if ticker_input.strip():
-                analyze_single_stock(ticker_input.strip().upper())
-            else:
-                st.warning("请输入有效的股票代码！")
-                
-    elif mode == "🚀 强势股多因子扫描":
-        st.header("🚀 强势股多因子扫描 (严格策略)")
-        st.markdown("**选股逻辑**：价格 > 20日均线 **且** MACD处于多头 **且** RSI处于强势区(50~80)。")
-        
-        # 默认改为 A股常用蓝筹股池
-        default_pool = "600519.SS, 000858.SZ, 600036.SS, 000001.SZ, 601318.SS, 600276.SS, 002594.SZ, 601012.SS"
-        tickers_input = st.text_area("请输入 A股 股票池(用英文逗号分隔)：", default_pool)
-        
-        if st.button("开始批量扫描", type="primary"):
-            if tickers_input.strip():
-                raw_list = tickers_input.split(",")
-                stock_list = [t.strip().upper() for t in raw_list if t.strip()]
-                
-                if len(stock_list) > 0:
-                    batch_scan_stocks(stock_list)
-                else:
-                    st.warning("提取不到有效代码，请检查格式。")
-            else:
-                st.warning("股票池不能为空！")
-
-if __name__ == "__main__":
-    main()
+        ticker_input = st.text_input("请输入单只股票代码 (如: 60051
