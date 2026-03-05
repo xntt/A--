@@ -4,7 +4,7 @@ import pandas as pd
 import time
 
 # 设置页面基本配置
-st.set_page_config(page_title="股票智能诊断与扫描系统", page_icon="📈", layout="wide")
+st.set_page_config(page_title="股票智能诊断与扫描", page_icon="📈", layout="wide")
 
 # ==========================================
 # 功能一：个股深度诊断
@@ -65,12 +65,13 @@ def analyze_single_stock(ticker_symbol):
         except Exception as e:
             st.error(f"分析过程中发生错误: {e}")
 
+
 # ==========================================
 # 功能二：优质股批量安全扫描
 # ==========================================
 def batch_scan_stocks(stock_list):
     st.subheader("🚀 优质股自动扫描")
-    st.info(f"共需扫描 {len(stock_list)} 只股票。为防止接口封禁，每只股票扫描后将**暂停 2 秒**，请耐心等待。")
+    st.info(f"共扫描 {len(stock_list)} 只股票。为防封禁，每只扫描后暂停2秒，请稍候。")
     
     # 初始化UI组件：进度条和文本提示
     progress_bar = st.progress(0)
@@ -91,7 +92,7 @@ def batch_scan_stocks(stock_list):
                 latest_close = hist['Close'].iloc[-1]
                 ma20 = hist['MA20'].iloc[-1]
                 
-                # 优质股筛选条件：最新收盘价站上20日均线 (你可以根据需要修改这里)
+                # 优质股筛选条件：最新收盘价站上20日均线
                 if latest_close > ma20:
                     good_stocks.append({
                         "股票代码": symbol,
@@ -100,21 +101,20 @@ def batch_scan_stocks(stock_list):
                         "当前状态": "🟢 站上短期均线"
                     })
         except Exception:
-            # 遇到单只股票错误（如停牌、退市、超时），直接跳过，防止整个程序崩溃
-            pass 
+            pass # 遇到错误直接跳过，防止程序崩溃
             
         # 更新进度条
         progress_bar.progress((i + 1) / len(stock_list))
         
-        # ★★★ 核心防封禁代码：强制休眠 ★★★
-        if i < len(stock_list) - 1: # 最后一只扫描完就不需要停顿了
+        # 核心防封禁代码：强制休眠
+        if i < len(stock_list) - 1:
             time.sleep(2)  
             
     status_text.text("✅ 全部扫描完成！")
     
     # 展示最终结果
     if good_stocks:
-        st.success(f"🎉 扫描结束！共发现 {len(good_stocks)} 只符合[站上20日均线]条件的强势股：")
+        st.success(f"🎉 发现 {len(good_stocks)} 只符合[站上20日均线]的强势股：")
         st.dataframe(pd.DataFrame(good_stocks), use_container_width=True)
     else:
         st.warning("扫描结束。本次股票池中未发现符合条件的股票。")
@@ -128,15 +128,13 @@ def main():
     
     # 侧边栏菜单
     st.sidebar.title("功能导航")
-    mode = st.sidebar.radio("请选择你要使用的功能：", ["🔍 个股深度诊断", "🚀 优质股自动扫描"])
-    
+    mode = st.sidebar.radio("请选择功能：", ["🔍 个股深度诊断", "🚀 优质股自动扫描"])
     st.sidebar.markdown("---")
-    st.sidebar.caption("注：数据来源为 Yahoo Finance。美股直接输入代码 (如 AAPL)；A股需加后缀 (沪市加 .SS，深市加 .SZ，如 600519.SS)。")
+    st.sidebar.caption("输入提示：美股直接输代码(如 AAPL)；A股需加后缀(如 600519.SS)。")
 
-    # 根据菜单选择显示对应页面
     if mode == "🔍 个股深度诊断":
         st.header("🔍 个股深度诊断")
-        ticker_input = st.text_input("请输入单只股票代码 (例如: AAPL, TSLA, 600519.SS)", "AAPL")
+        ticker_input = st.text_input("请输入单只股票代码 (如: AAPL):", "AAPL")
         
         if st.button("开始诊断", type="primary"):
             if ticker_input.strip():
@@ -147,4 +145,21 @@ def main():
     elif mode == "🚀 优质股自动扫描":
         st.header("🚀 优质股自动扫描 (防封禁模式)")
         default_pool = "AAPL, MSFT, GOOGL, AMZN, TSLA, META, NVDA, BABA, JD"
-        tickers_input = st.text_area("请输入要批量扫描的股票池 (请用英文逗号
+        # 【修改点】精简了下面这一行的文字，防止复制时过长导致自动换行断裂
+        tickers_input = st.text_area("请输入股票池(用英文逗号分隔)：", default_pool)
+        
+        if st.button("开始批量扫描", type="primary"):
+            if tickers_input.strip():
+                # 清洗输入的字符串，转换为列表
+                raw_list = tickers_input.split(",")
+                stock_list = [t.strip().upper() for t in raw_list if t.strip()]
+                
+                if len(stock_list) > 0:
+                    batch_scan_stocks(stock_list)
+                else:
+                    st.warning("提取不到有效代码，请检查格式。")
+            else:
+                st.warning("股票池不能为空！")
+
+if __name__ == "__main__":
+    main()
