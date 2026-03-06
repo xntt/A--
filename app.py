@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import requests
 import json
+import re
 import traceback
 
 st.set_page_config(page_title="量化交易雷达系统", layout="wide")
@@ -13,51 +14,61 @@ if "is_scanning" not in st.session_state: st.session_state.is_scanning = False
 if "all_stocks" not in st.session_state: st.session_state.all_stocks = []
 if "stats" not in st.session_state: st.session_state.stats = {"total": 0, "api_fail": 0, "logic_fail": 0, "success": 0}
 
-# ================= 恢复昨天最稳定的【东方财富引擎】 =================
-def get_stock_list_em():
-    """获取全市场5000+只股票，绝不限制100只"""
-    url = "http://82.push2.eastmoney.com/api/qt/clist/get"
-    params = {
-        "pn": "1", "pz": "6000", "po": "1", "np": "1", 
-        "ut": "bd1d9ddb04089700cf9c27f6f7426281", "fltt": "2", "invt": "2",
-        "fid": "f3", "fs": "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048",
-        "fields": "f12,f14"
-    }
-    try:
-        res = requests.get(url, params=params, timeout=5).json()
-        data = res.get("data", {}).get("diff", [])
-        valid_stocks = []
-        for i in data:
-            code = str(i["f12"])
-            name = str(i["f14"])
-            if not name.startswith("ST") and not name.startswith("*ST"):
-                valid_stocks.append({"code": code, "name": name})
-        return valid_stocks
-    except Exception:
-        return []
+# ================= 纯血新浪引擎 1：自动翻页获取全市场5000+名单 =================
+def fetch_all_stock_codes_sina():
+    valid_stocks = []
+    # 新浪现在一页最多返回80个左右，我们强制循环翻页60-80页，把5000多只全部捞出来！
+    for page in range(1, 80):
+        url = "http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData"
+        params = {"page": str(page), "num": "80", "sort": "symbol", "asc": "1", "node": "hs_a", "symbol": "", "_s_r_a": "init"}
+        try:
+            res = requests.get(url, params=params, timeout=3)
+            # 正则修复新浪返回的不标准 JSON 格式
+            text = re.sub(r'([{,])\s*([a-zA-Z_0-9]+)\s*:', r'\1"\2":', res.text)
+            data = json.loads(text)
+            
+            # 如果这一页空了，说明到底了，结束翻页
+            if not data or not isinstance(data, list) or len(data) == 0:
+                break
+                
+            for item in data:
+                c = item.get("symbol", "")
+                n = item.get("name", "")
+                # 过滤掉 ST 股，只取正常股票
+                if c and n and not n.startswith("ST") and not n.startswith("*ST"):
+                    valid_stocks.append({'code': c[-6:], 'name': n})
+        except Exception:
+            break # 遇到异常跳出翻页
+            
+    return valid_stocks
 
-def get_kline_em(code, days=65):
-    """东方财富K线，速度比新浪快10倍，不漏数据"""
-    secid = f"1.{code}" if str(code).startswith('6') else f"0.{code}"
-    url = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
-    params = {
-        "secid": secid, "ut": "7eea3edcaed734bea9cbfc24409ed989",
-        "fields1": "f1,f2,f3,f4,f5,f6", "fields2": "f51,f52,f53,f54,f55,f56",
-        "klt": "101", "fqt": "1", "end": "20500000", "lmt": str(days)
-    }
+# ================= 纯血新浪引擎 2：获取K线 =================
+def fetch_kline_data_sina(stock_code, days=65):
+    code_str = str(stock_code).strip().zfill(6)
+    prefix = 'sh' if code_str.startswith('6') or code_str.startswith('9') else 'sz'
+    symbol = prefix + code_str 
+    
+    url = "http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
+    params = {"symbol": symbol, "scale": "240", "ma": "no", "datalen": str(days)}
+    
     try:
-        res = requests.get(url, params=params, timeout=3).json()
-        klines = res.get("data", {}).get("klines", [])
-        parsed = []
-        for k in klines:
-            parts = k.split(",")
-            parsed.append({
-                "Date": parts[0], "Open": float(parts[1]), "Close": float(parts[2]),
-                "High": float(parts[3]), "Low": float(parts[4]), "Volume": float(parts[5])
-            })
-        return pd.DataFrame(parsed)
+        res = requests.get(url, params=params, timeout=3)
+        text = re.sub(r'([{,])\s*([a-zA-Z_0-9]+)\s*:', r'\1"\2":', res.text)
+        data = json.loads(text)
+        
+        if data and isinstance(data, list):
+            parsed = []
+            for k in data:
+                parsed.append({
+                    "Date": k.get("day"),
+                    "Open": float(k.get("open", 0)),
+                    "Close": float(k.get("close", 0)),
+                    "Volume": float(k.get("volume", 0))
+                })
+            return pd.DataFrame(parsed)
     except Exception:
-        return pd.DataFrame()
+        pass
+    return pd.DataFrame()
 
 # ================= 核心指标计算 =================
 def calculate_indicators(df):
@@ -81,10 +92,10 @@ mode = st.sidebar.radio("选择操作阶段：", [
 try:
     # ================= 阶段一：全市场海选 =================
     if mode == "🎯 阶段一：全市场海选 (断点续传+全局归类)":
-        st.title("🎯 全市场潜伏雷达 (满血恢复版)")
-        st.info("💡 恢复昨日最稳定的断点续传功能！一次扫描即可为股票贴上【趋势低吸/底部启动/稳健波段】标签！")
+        st.title("🎯 全市场潜伏雷达 (纯血新浪修复版)")
+        st.info("💡 修复了新浪分页只给100只的Bug，现在会在后台自动翻页拼接5000+全市场名单！")
         
-        scan_limit = st.slider("选择本次总扫描数量（支持扫遍A股5000只）：", 100, 5500, 5000, step=100)
+        scan_limit = st.slider("选择本次总扫描数量（现在真正可以扫遍5000只）：", 100, 5500, 5000, step=100)
         
         # 控制台按钮
         col_btn1, col_btn2, col_btn3 = st.columns(3)
@@ -92,8 +103,12 @@ try:
             if st.button("▶️ 开始 / 继续扫描", type="primary"):
                 st.session_state.is_scanning = True
                 if not st.session_state.all_stocks:
-                    with st.spinner("正在从东方财富极速拉取全市场名单..."):
-                        st.session_state.all_stocks = get_stock_list_em()
+                    with st.spinner("正在从新浪逐页拼接全市场名单，大概需要几秒钟，请稍候..."):
+                        st.session_state.all_stocks = fetch_all_stock_codes_sina()
+                        if st.session_state.all_stocks:
+                            st.success(f"✅ 成功从新浪获取到了 {len(st.session_state.all_stocks)} 只股票名单！")
+                        else:
+                            st.error("❌ 获取新浪名单失败，请检查网络！")
         with col_btn2:
             if st.button("⏸️ 暂停扫描"):
                 st.session_state.is_scanning = False
@@ -125,7 +140,7 @@ try:
         if total_target > 0:
             progress_bar.progress(curr_total / total_target)
 
-        # 核心扫描循环 (如果处于扫描状态)
+        # 核心扫描循环
         if st.session_state.is_scanning and st.session_state.all_stocks:
             target_stocks = st.session_state.all_stocks[:scan_limit]
             total_target = len(target_stocks)
@@ -139,7 +154,7 @@ try:
                 code = stock['code']
                 name = stock['name']
                 
-                hist = get_kline_em(code, days=65)
+                hist = fetch_kline_data_sina(code, days=65)
                 
                 if hist.empty or len(hist) < 2:
                     st.session_state.stats["api_fail"] += 1
@@ -244,7 +259,7 @@ try:
                             clean_code = ''.join(filter(str.isdigit, raw_code))[-6:] 
                             
                             if len(clean_code) == 6:
-                                df = get_kline_em(clean_code, days=30)
+                                df = fetch_kline_data_sina(clean_code, days=30)
                                 score = 60 
                                 
                                 if not df.empty and len(df) >= 20:
@@ -284,7 +299,7 @@ try:
                 st.warning("⚠️ 请输入正确的6位纯数字股票代码！")
             else:
                 with st.spinner("正在获取最新K线数据..."):
-                    df = get_kline_em(target_code, days=120)
+                    df = fetch_kline_data_sina(target_code, days=120)
                     
                 if df.empty:
                     st.error("❌ 获取数据失败，该代码不存在或退市！")
