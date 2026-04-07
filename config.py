@@ -1,60 +1,37 @@
 # config.py
-"""全局配置 — 所有阈值和参数"""
 
 from datetime import datetime, timedelta
 
-# ==================== 请求头 ====================
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Referer": "https://data.eastmoney.com/",
     "Accept": "*/*",
 }
 
-# ==================== 模块1：公告前异动 ====================
-VOLUME_ANOMALY_RATIO = 3.0        # 成交量异常倍数(vs 20日均量)
-AMOUNT_ANOMALY_RATIO = 3.0        # 成交额异常倍数
-PRE_ANNOUNCE_WINDOW = 5           # 公告前检测窗口(交易日)
-BASELINE_WINDOW = 20              # 基准窗口
+VOLUME_ANOMALY_RATIO = 2.5
+AMOUNT_ANOMALY_RATIO = 2.5
+PRE_ANNOUNCE_WINDOW = 5
+BASELINE_WINDOW = 20
+
 POSITIVE_KEYWORDS = [
     "收购", "重组", "增持", "回购", "中标", "签约",
-    "战略合作", "业绩预增", "高送转", "股权激励"
+    "战略合作", "业绩预增", "高送转", "股权激励", "合作"
 ]
 NEGATIVE_KEYWORDS = [
-    "减持", "业绩预减", "亏损", "处罚", "退市", "违规", "立案"
+    "减持", "业绩预减", "亏损", "处罚", "退市", "违规", "立案", "风险"
 ]
 
-# ==================== 模块2：龙虎榜 ====================
 FAMOUS_SEATS = {
-    "作手新一": "东方财富证券拉萨团结路第二",
-    "炒股养家": "国信证券深圳泰然九路",
-    "赵老哥": "华鑫证券上海宛平南路",
-    "方新侠": "中国银河证券绍兴",
-    "小鳄鱼": "华泰证券深圳益田路荣超",
-    "佛山无影脚": "东方证券佛山季华六路",
-    "欢乐海岸": "中信证券深圳欢乐海岸",
-    "金田路": "国信证券深圳金田路",
-    "首板进击者": "中信建投证券成都市南一环路",
+    "作手新一": "拉萨团结路第二",
+    "炒股养家": "泰然九路",
+    "赵老哥": "宛平南路",
+    "方新侠": "银河证券绍兴",
+    "佛山无影脚": "佛山季华六路",
+    "欢乐海岸": "欢乐海岸",
+    "金田路": "金田路",
 }
 
-# ==================== 模块3：大宗交易 ====================
-BLOCK_DISCOUNT_THRESHOLD = -5.0   # 折价率预警线%
-BLOCK_AMOUNT_MIN = 500            # 最低金额万元
-
-# ==================== 模块4：高管减持 ====================
-REDUCTION_PRECISION_WINDOW = 30   # 减持后N日内出利空=精准
-
-# ==================== 模块5：融资融券 ====================
-MARGIN_SPIKE_RATIO = 2.0          # 融券余额暴增倍数
-
-# ==================== 预警颜色 ====================
-COLORS = {
-    "critical": "#FF0000",
-    "high": "#FF4444",
-    "mid": "#FF8800",
-    "low": "#FFCC00",
-    "info": "#4488FF",
-    "green": "#00CC66",
-    "red": "#CC3333",
-}
+BLOCK_DISCOUNT_THRESHOLD = -3.0
+BLOCK_AMOUNT_MIN = 300
+MARGIN_SPIKE_RATIO = 1.8
