@@ -1,305 +1,470 @@
-import streamlit as st
-import pandas as pd
+# data/eastmoney_api.py
+"""
+东方财富原始HTTP接口封装
+不依赖任何第三方金融数据库，全部直连东方财富服务器
+"""
+
 import requests
 import json
-import re
-import traceback
-
-st.set_page_config(page_title="量化交易雷达系统", layout="wide")
-
-# ================= 全局状态与断点续传 =================
-if "found_stocks" not in st.session_state: st.session_state.found_stocks = []
-if "scan_index" not in st.session_state: st.session_state.scan_index = 0
-if "is_scanning" not in st.session_state: st.session_state.is_scanning = False
-if "all_stocks" not in st.session_state: st.session_state.all_stocks = []
-if "stats" not in st.session_state: st.session_state.stats = {"total": 0, "api_fail": 0, "logic_fail": 0, "success": 0}
-
-# ================= 纯血新浪引擎 1：获取全市场名单 =================
-def fetch_all_stock_codes_sina():
-    valid_stocks = []
-    for page in range(1, 80):
-        url = "http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData"
-        params = {"page": str(page), "num": "80", "sort": "symbol", "asc": "1", "node": "hs_a", "symbol": "", "_s_r_a": "init"}
-        try:
-            res = requests.get(url, params=params, timeout=3)
-            text = re.sub(r'([{,])\s*([a-zA-Z_0-9]+)\s*:', r'\1"\2":', res.text)
-            data = json.loads(text)
-            if not data or not isinstance(data, list) or len(data) == 0: break
-            for item in data:
-                c = item.get("symbol", "")
-                n = item.get("name", "")
-                if c and n and not n.startswith("ST") and not n.startswith("*ST"):
-                    valid_stocks.append({'code': c[-6:], 'name': n})
-        except Exception:
-            break
-    return valid_stocks
-
-# ================= 纯血新浪引擎 2：获取K线 =================
-def fetch_kline_data_sina(stock_code, days=65):
-    code_str = str(stock_code).strip().zfill(6)
-    prefix = 'sh' if code_str.startswith('6') or code_str.startswith('9') else 'sz'
-    symbol = prefix + code_str 
-    
-    url = "http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
-    params = {"symbol": symbol, "scale": "240", "ma": "no", "datalen": str(days)}
-    try:
-        res = requests.get(url, params=params, timeout=3)
-        text = re.sub(r'([{,])\s*([a-zA-Z_0-9]+)\s*:', r'\1"\2":', res.text)
-        data = json.loads(text)
-        if data and isinstance(data, list):
-            parsed = []
-            for k in data:
-                parsed.append({
-                    "Date": k.get("day"),
-                    "Open": float(k.get("open", 0)),
-                    "Close": float(k.get("close", 0)),
-                    "Volume": float(k.get("volume", 0))
-                })
-            return pd.DataFrame(parsed)
-    except Exception:
-        pass
-    return pd.DataFrame()
-
-# ================= 核心指标计算 =================
-def calculate_indicators(df):
-    if df.empty: return df
-    df['MA5'] = df['Close'].rolling(window=5, min_periods=1).mean()
-    df['MA10'] = df['Close'].rolling(window=10, min_periods=1).mean()
-    df['MA20'] = df['Close'].rolling(window=20, min_periods=1).mean()
-    df['MA60'] = df['Close'].rolling(window=60, min_periods=1).mean()
-    df['VMA5'] = df['Volume'].rolling(window=5, min_periods=1).mean()
-    df['VMA20'] = df['Volume'].rolling(window=20, min_periods=1).mean()
-    return df
-
-# ================= 侧边栏导航 =================
-st.sidebar.title("⚡ 智能量化交易工作流")
-mode = st.sidebar.radio("选择操作阶段：", [
-    "🎯 阶段一：全市场海选 (断点续传+全局归类)", 
-    "🏆 阶段二：防追高打分与最佳买点计算", 
-    "🔍 阶段三：个股形态复诊"
-])
-
-try:
-    # ================= 阶段一：全市场海选 =================
-    if mode == "🎯 阶段一：全市场海选 (断点续传+全局归类)":
-        st.title("🎯 全市场潜伏雷达")
-        scan_limit = st.slider("选择本次总扫描数量：", 100, 5500, 5000, step=100)
-        
-        col_btn1, col_btn2, col_btn3 = st.columns(3)
-        with col_btn1:
-            if st.button("▶️ 开始 / 继续扫描", type="primary"):
-                st.session_state.is_scanning = True
-                if not st.session_state.all_stocks:
-                    with st.spinner("正在从新浪逐页拼接全市场名单..."):
-                        st.session_state.all_stocks = fetch_all_stock_codes_sina()
-        with col_btn2:
-            if st.button("⏸️ 暂停扫描"): st.session_state.is_scanning = False
-        with col_btn3:
-            if st.button("🔄 重置进度清空数据"):
-                st.session_state.is_scanning = False
-                st.session_state.scan_index = 0
-                st.session_state.found_stocks = []
-                st.session_state.stats = {"total": 0, "api_fail": 0, "logic_fail": 0, "success": 0}
-                st.session_state.all_stocks = []
-                st.rerun()
-
-        col1, col2, col3, col4 = st.columns(4)
-        metric_total = col1.empty()
-        metric_api_fail = col2.empty()
-        metric_logic_fail = col3.empty()
-        metric_success = col4.empty()
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        total_target = min(scan_limit, len(st.session_state.all_stocks)) if st.session_state.all_stocks else scan_limit
-        curr_total = st.session_state.stats["total"]
-        metric_total.metric("已扫描进度", str(curr_total) + " / " + str(total_target))
-        metric_api_fail.metric("❌无数据/停牌", st.session_state.stats["api_fail"])
-        metric_logic_fail.metric("📉形态不符", st.session_state.stats["logic_fail"])
-        metric_success.metric("🎉成功入选", st.session_state.stats["success"])
-        if total_target > 0: progress_bar.progress(curr_total / total_target)
-
-        if st.session_state.is_scanning and st.session_state.all_stocks:
-            target_stocks = st.session_state.all_stocks[:scan_limit]
-            total_target = len(target_stocks)
-            
-            for i in range(st.session_state.scan_index, total_target):
-                if not st.session_state.is_scanning: break 
-                
-                stock = target_stocks[i]
-                code = stock['code']
-                name = stock['name']
-                hist = fetch_kline_data_sina(code, days=65)
-                
-                if hist.empty or len(hist) < 2:
-                    st.session_state.stats["api_fail"] += 1
-                else:
-                    df = calculate_indicators(hist)
-                    latest = df.iloc[-1]
-                    prev1 = df.iloc[-2]
-                    
-                    matched_shapes = []
-                    if latest['MA20'] > latest['MA60'] and abs(latest['Close'] - latest['MA20']) / latest['MA20'] < 0.04 and latest['Volume'] < latest['VMA5'] * 0.9:
-                        matched_shapes.append("📉趋势低吸")
-                    if latest['Close'] > latest['MA60'] and prev1['Close'] <= prev1['MA60'] and latest['Volume'] > latest['VMA20'] * 1.5:
-                        matched_shapes.append("🚀底部启动")
-                    if latest['MA5'] > latest['MA10'] > latest['MA20'] > latest['MA60'] and latest['Close'] > latest['MA5']:
-                        matched_shapes.append("📈稳健波段")
-                    
-                    if matched_shapes:
-                        st.session_state.stats["success"] += 1
-                        st.session_state.found_stocks.append({
-                            "股票代码": code, "股票名称": name, 
-                            "当前价": round(latest['Close'], 2), "符合形态": " + ".join(matched_shapes)
-                        })
-                        status_text.success("🔥 最新发现：" + name + " -> " + " + ".join(matched_shapes))
-                    else:
-                        st.session_state.stats["logic_fail"] += 1
-
-                st.session_state.stats["total"] += 1
-                st.session_state.scan_index = i + 1
-                
-                if i % 10 == 0 or i == total_target - 1:
-                    curr_total = st.session_state.stats["total"]
-                    metric_total.metric("已扫描进度", str(curr_total) + " / " + str(total_target))
-                    metric_api_fail.metric("❌无数据/停牌", st.session_state.stats["api_fail"])
-                    metric_logic_fail.metric("📉形态不符", st.session_state.stats["logic_fail"])
-                    metric_success.metric("🎉成功入选", st.session_state.stats["success"])
-                    progress_bar.progress(curr_total / total_target)
-
-            if st.session_state.scan_index >= total_target:
-                st.session_state.is_scanning = False
-                status_text.info("✅ 本次扫描任务已全部完成！")
-                st.balloons()
-                st.rerun()
-
-        if st.session_state.found_stocks:
-            st.subheader("🏆 海选入围名单")
-            df_result = pd.DataFrame(st.session_state.found_stocks)
-            st.dataframe(df_result, use_container_width=True)
-            csv_data = df_result.to_csv(index=False).encode('utf-8-sig')
-            st.download_button("💾 下载表格 (用于阶段二)", data=csv_data, file_name="全市场归类结果.csv", mime="text/csv")
+import time
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from typing import Optional, Dict, List
+import streamlit as st
+from config import EASTMONEY_HEADERS
 
 
-    # ================= 阶段二：防追高打分与最佳买点计算 =================
-    elif mode == "🏆 阶段二：防追高打分与最佳买点计算":
-        st.title("🏆 AI 防追高过滤 & 黄金买点测算")
-        st.info("💡 剔除暴涨高位股！计算每只股票的最佳潜伏价（MA20附近），并按买入安全性为您排名。")
-        
-        uploaded_file = st.file_uploader("📂 请上传阶段一生成的表格 (或包含代码列的CSV/Excel)：", type=["csv", "xlsx"])
-        
-        if uploaded_file is not None:
-            df_upload = pd.DataFrame()
+class EastMoneyAPI:
+    """东方财富全接口"""
+
+    # ====================== 基础请求 ======================
+
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update(EASTMONEY_HEADERS)
+
+    def _request(self, url: str, params: dict, timeout: int = 15) -> dict:
+        """通用请求方法，带重试"""
+        for attempt in range(3):
             try:
-                if uploaded_file.name.endswith('.csv'):
-                    try: df_upload = pd.read_csv(uploaded_file, encoding='utf-8', dtype=str)
-                    except UnicodeDecodeError: df_upload = pd.read_csv(uploaded_file, encoding='gbk', dtype=str)
-                else: df_upload = pd.read_excel(uploaded_file, dtype=str)
-                
-                code_col = None
-                for col in df_upload.columns:
-                    if "代码" in col or "code" in col.lower() or "f12" in col:
-                        code_col = col; break
-                        
-                if not code_col: st.error("❌ 找不到包含 '代码' 的列！")
-                else:
-                    st.success("成功载入 " + str(len(df_upload)) + " 只股票，准备进行防追高诊断！")
-                    
-                    if st.button("🚀 开始过滤并计算买点", type="primary"):
-                        scored_stocks = []
-                        progress_bar = st.progress(0)
-                        total_upload = len(df_upload)
-                        
-                        for i, row in df_upload.iterrows():
-                            raw_code = str(row[code_col]).strip()
-                            clean_code = ''.join(filter(str.isdigit, raw_code))[-6:] 
-                            stock_name = row.get('股票名称', row.get('name', '未知'))
-                            
-                            if len(clean_code) == 6:
-                                df = fetch_kline_data_sina(clean_code, days=65)
-                                if not df.empty and len(df) >= 30:
-                                    df = calculate_indicators(df)
-                                    latest = df.iloc[-1]
-                                    
-                                    # 基础分设定 (满分100)
-                                    score = 50 
-                                    if latest['MA5'] > latest['MA20']: score += 15 # 短期多头
-                                    if latest['MA20'] > latest['MA60']: score += 15 # 中期多头
-                                    if latest['Close'] > latest['MA5']: score += 10 # 站上5日线
-                                    if latest['Volume'] > latest['VMA5']: score += 10 # 放量
-                                    
-                                    # 核心计算：乖离率 (距离最佳买点MA20的百分比)
-                                    close_price = latest['Close']
-                                    ma20_price = latest['MA20']
-                                    bias_percent = ((close_price - ma20_price) / ma20_price) * 100
-                                    
-                                    # 【防追高惩罚机制】
-                                    if bias_percent > 8:
-                                        score -= 30 # 偏离均线超8%，大概率在山顶，重罚！
-                                    elif bias_percent > 5:
-                                        score -= 10 # 偏高
-                                    elif bias_percent < 0:
-                                        score -= 10 # 跌破生命线，形态破坏
-                                        
-                                    # 判定操作建议
-                                    action = ""
-                                    if 0 <= bias_percent <= 2.5: action = "⭐⭐⭐ 绝佳潜伏 (紧贴均线)"
-                                    elif 2.5 < bias_percent <= 5: action = "⭐⭐ 可轻仓 (稍微偏高)"
-                                    elif bias_percent > 5: action = "❌ 极度高估 (切勿追高)"
-                                    else: action = "⚠️ 破位风险 (跌破生命线)"
-                                    
-                                    scored_stocks.append({
-                                        "股票代码": clean_code,
-                                        "股票名称": stock_name,
-                                        "当前价格": round(close_price, 2),
-                                        "最佳买入价(MA20)": round(ma20_price, 2),
-                                        "距离买点溢价(%)": round(bias_percent, 2),
-                                        "AI 综合得分": score,
-                                        "操作建议": action
-                                    })
-                                    
-                            progress_bar.progress(int(((i + 1) / total_upload) * 100))
-                            
-                        if scored_stocks:
-                            # 排序逻辑：先挑出及格的(>=70分)，然后按“距离买点百分比”从小到大排！最贴近买点的在最上面！
-                            df_scored = pd.DataFrame(scored_stocks)
-                            df_good = df_scored[df_scored['AI 综合得分'] >= 70].copy()
-                            
-                            # 按偏离度绝对值排序（谁最接近0，谁排第一）
-                            df_good['偏离度绝对值'] = df_good['距离买点溢价(%)'].abs()
-                            df_final = df_good.sort_values(by="偏离度绝对值", ascending=True).drop(columns=['偏离度绝对值'])
-                            
-                            st.success("✅ 计算完成！已剔除追高风险股。以下是最安全、最接近【黄金买点】的优质标的：")
-                            st.dataframe(df_final, use_container_width=True)
+                resp = self.session.get(url, params=params, timeout=timeout)
+                resp.raise_for_status()
+                text = resp.text
+
+                # 处理JSONP格式
+                if text.startswith("jQuery") or text.startswith("callback"):
+                    start = text.index("(") + 1
+                    end = text.rindex(")")
+                    text = text[start:end]
+
+                return json.loads(text)
             except Exception as e:
-                st.error("❌ 处理出错：" + str(e))
+                if attempt == 2:
+                    st.warning(f"API请求失败: {url} → {e}")
+                    return {}
+                time.sleep(0.5)
+        return {}
 
-    # ================= 阶段三：个股形态复诊 =================
-    elif mode == "🔍 阶段三：个股形态复诊":
-        st.title("🔍 个股形态复诊 (X光看诊)")
-        manual_input = st.text_input("✍️ 请输入要诊断的 6 位代码（如 000001）：")
-        if st.button("📊 生成诊断报告", type="primary"):
-            target_code = manual_input.strip()
-            if not target_code or not target_code.isdigit() or len(target_code) != 6:
-                st.warning("⚠️ 请输入正确的6位代码！")
-            else:
-                with st.spinner("获取K线数据..."):
-                    df = fetch_kline_data_sina(target_code, days=120)
-                if df.empty:
-                    st.error("❌ 获取失败！")
-                else:
-                    df = calculate_indicators(df)
-                    latest = df.iloc[-1]
-                    st.subheader(target_code + " 近期走势分析")
-                    chart_data = df.set_index('Date')[['Close', 'MA10', 'MA20']]
-                    st.line_chart(chart_data)
-                    
-                    colA, colB, colC = st.columns(3)
-                    colA.metric("当前收盘价", round(latest['Close'], 2))
-                    colB.metric("20日均线(最佳买点)", round(latest['MA20'], 2))
-                    bias = round(((latest['Close'] - latest['MA20'])/latest['MA20'])*100, 2)
-                    colC.metric("当前偏离度", str(bias) + "%")
+    def _get_secid(self, stock_code: str) -> str:
+        """股票代码转东方财富secid"""
+        if stock_code.startswith("6"):
+            return f"1.{stock_code}"
+        elif stock_code.startswith(("0", "3")):
+            return f"0.{stock_code}"
+        elif stock_code.startswith(("4", "8")):
+            return f"0.{stock_code}"
+        return f"1.{stock_code}"
 
-except Exception as e:
-    st.error("🚨 运行异常：" + str(e))
-    st.code(traceback.format_exc())
+    # ====================== 个股K线 ======================
+
+    def get_stock_kline(self, stock_code: str, days: int = 60,
+                        klt: int = 101) -> pd.DataFrame:
+        """
+        获取个股K线数据
+        klt: 101=日K 102=周K 103=月K
+        """
+        secid = self._get_secid(stock_code)
+        url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+        params = {
+            "secid": secid,
+            "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+            "klt": klt,
+            "fqt": 1,  # 前复权
+            "end": "20500101",
+            "lmt": days,
+        }
+        data = self._request(url, params)
+        if not data or "data" not in data or not data["data"]:
+            return pd.DataFrame()
+
+        klines = data["data"].get("klines", [])
+        if not klines:
+            return pd.DataFrame()
+
+        records = []
+        for line in klines:
+            parts = line.split(",")
+            if len(parts) >= 11:
+                records.append({
+                    "date": parts[0],
+                    "open": float(parts[1]),
+                    "close": float(parts[2]),
+                    "high": float(parts[3]),
+                    "low": float(parts[4]),
+                    "volume": int(parts[5]),        # 手
+                    "amount": float(parts[6]),       # 元
+                    "amplitude": float(parts[7]),    # 振幅%
+                    "change_pct": float(parts[8]),   # 涨跌幅%
+                    "change_amt": float(parts[9]),   # 涨跌额
+                    "turnover_rate": float(parts[10])  # 换手率%
+                })
+
+        df = pd.DataFrame(records)
+        df["date"] = pd.to_datetime(df["date"])
+        df["stock_code"] = stock_code
+        return df
+
+    # ====================== 个股实时行情 ======================
+
+    def get_stock_realtime(self, stock_code: str) -> dict:
+        """获取个股实时行情"""
+        secid = self._get_secid(stock_code)
+        url = "https://push2.eastmoney.com/api/qt/stock/get"
+        params = {
+            "secid": secid,
+            "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+            "fields": "f43,f44,f45,f46,f47,f48,f50,f51,f52,f55,f57,f58,"
+                       "f60,f71,f116,f117,f162,f167,f168,f169,f170,f171,"
+                       "f177,f192,f193",
+            "invt": 2,
+        }
+        data = self._request(url, params)
+        if data and "data" in data:
+            return data["data"]
+        return {}
+
+    # ====================== 全市场股票列表 ======================
+
+    def get_all_stocks(self, market: str = "all") -> pd.DataFrame:
+        """获取全市场股票列表+实时行情"""
+        url = "https://push2.eastmoney.com/api/qt/clist/get"
+
+        fs_map = {
+            "sh": "m:1+t:2,m:1+t:23",
+            "sz": "m:0+t:6,m:0+t:13,m:0+t:80",
+            "all": "m:0+t:6,m:0+t:13,m:0+t:80,m:1+t:2,m:1+t:23",
+            "cyb": "m:0+t:80",
+            "kcb": "m:1+t:23",
+        }
+        params = {
+            "pn": 1, "pz": 6000,
+            "po": 1, "np": 1,
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            "fltt": 2, "invt": 2,
+            "fid": "f3",
+            "fs": fs_map.get(market, fs_map["all"]),
+            "fields": "f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f14,f15,f16,f17,f18,f20,f21",
+        }
+        data = self._request(url, params)
+        if not data or "data" not in data or not data["data"]:
+            return pd.DataFrame()
+
+        records = data["data"].get("diff", [])
+        df = pd.DataFrame(records)
+        col_map = {
+            "f12": "stock_code", "f14": "stock_name",
+            "f2": "latest_price", "f3": "change_pct",
+            "f4": "change_amt", "f5": "volume",
+            "f6": "amount", "f7": "amplitude",
+            "f8": "turnover_rate", "f9": "pe_ratio",
+            "f15": "high", "f16": "low",
+            "f17": "open", "f18": "pre_close",
+            "f20": "total_mv", "f21": "circulating_mv",
+        }
+        df = df.rename(columns=col_map)
+        return df
+
+    # ====================== 龙虎榜数据 ======================
+
+    def get_dragon_tiger_list(self, date: str = None,
+                               page_size: int = 200) -> pd.DataFrame:
+        """
+        获取龙虎榜数据
+        date: YYYY-MM-DD格式
+        """
+        if date is None:
+            date = datetime.now().strftime("%Y-%m-%d")
+
+        url = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+        params = {
+            "reportName": "RPT_DAILYBILLBOARD_DETAILSNEW",
+            "columns": "ALL",
+            "source": "WEB",
+            "client": "WEB",
+            "sortColumns": "TRADE_DATE,SECURITY_CODE",
+            "sortTypes": "-1,1",
+            "pageNumber": 1,
+            "pageSize": page_size,
+            "filter": f'(TRADE_DATE>=\'{date}\')(TRADE_DATE<=\'{date}\')',
+        }
+        data = self._request(url, params)
+        if not data or "result" not in data or not data["result"]:
+            return pd.DataFrame()
+
+        records = data["result"].get("data", [])
+        if not records:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(records)
+
+        # 标准化列名
+        col_map = {
+            "TRADE_DATE": "trade_date",
+            "SECURITY_CODE": "stock_code",
+            "SECURITY_NAME_ABBR": "stock_name",
+            "CLOSE_PRICE": "close_price",
+            "CHANGE_RATE": "change_pct",
+            "BILLBOARD_NET_AMT": "net_amount",        # 龙虎榜净买额
+            "BILLBOARD_BUY_AMT": "buy_amount",        # 龙虎榜买入额
+            "BILLBOARD_SELL_AMT": "sell_amount",       # 龙虎榜卖出额
+            "BILLBOARD_DEAL_AMT": "deal_amount",       # 龙虎榜成交额
+            "ACCUM_AMOUNT": "total_amount",            # 总成交额
+            "DEAL_NET_RATIO": "net_ratio",             # 净买入占比
+            "TURNOVERRATE": "turnover_rate",
+            "FREE_MARKET_CAP": "free_mv",
+            "EXPLANATION": "reason",                    # 上榜原因
+        }
+        df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+        return df
+
+    # ====================== 龙虎榜营业部明细 ======================
+
+    def get_dragon_tiger_detail(self, stock_code: str,
+                                 date: str) -> pd.DataFrame:
+        """获取龙虎榜营业部买卖明细"""
+        url = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+        params = {
+            "reportName": "RPT_BILLBOARD_DAILYDETAILSBUY",  # 买入明细
+            "columns": "ALL",
+            "source": "WEB",
+            "client": "WEB",
+            "sortColumns": "BUY",
+            "sortTypes": "-1",
+            "pageNumber": 1,
+            "pageSize": 50,
+            "filter": f"(TRADE_DATE='{date}')(SECURITY_CODE=\"{stock_code}\")",
+        }
+
+        # 买入方
+        data_buy = self._request(url, params)
+        buy_records = []
+        if data_buy and "result" in data_buy and data_buy["result"]:
+            buy_records = data_buy["result"].get("data", [])
+
+        # 卖出方
+        params["reportName"] = "RPT_BILLBOARD_DAILYDETAILSSELL"
+        params["sortColumns"] = "SELL"
+        data_sell = self._request(url, params)
+        sell_records = []
+        if data_sell and "result" in data_sell and data_sell["result"]:
+            sell_records = data_sell["result"].get("data", [])
+
+        results = []
+        for r in buy_records:
+            results.append({
+                "trade_date": date,
+                "stock_code": stock_code,
+                "direction": "买入",
+                "seat_name": r.get("OPERATEDEPT_NAME", ""),
+                "buy_amount": r.get("BUY", 0),
+                "sell_amount": r.get("SELL", 0),
+                "net_amount": r.get("NET", 0),
+                "rank": r.get("RANK", 0),
+            })
+        for r in sell_records:
+            results.append({
+                "trade_date": date,
+                "stock_code": stock_code,
+                "direction": "卖出",
+                "seat_name": r.get("OPERATEDEPT_NAME", ""),
+                "buy_amount": r.get("BUY", 0),
+                "sell_amount": r.get("SELL", 0),
+                "net_amount": r.get("NET", 0),
+                "rank": r.get("RANK", 0),
+            })
+
+        return pd.DataFrame(results)
+
+    # ====================== 龙虎榜营业部统计 ======================
+
+    def get_seat_statistics(self, days: int = 30) -> pd.DataFrame:
+        """获取营业部龙虎榜统计排名"""
+        url = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+        params = {
+            "reportName": "RPT_OPERATEDEPT_TRADE",
+            "columns": "ALL",
+            "source": "WEB",
+            "client": "WEB",
+            "sortColumns": "TOTAL_NETAMT",
+            "sortTypes": "-1",
+            "pageNumber": 1,
+            "pageSize": 100,
+            "filter": "",
+        }
+        data = self._request(url, params)
+        if not data or "result" not in data or not data["result"]:
+            return pd.DataFrame()
+        records = data["result"].get("data", [])
+        return pd.DataFrame(records) if records else pd.DataFrame()
+
+    # ====================== 大宗交易数据 ======================
+
+    def get_block_trades(self, start_date: str = None,
+                          end_date: str = None,
+                          page_size: int = 500) -> pd.DataFrame:
+        """获取大宗交易数据"""
+        if end_date is None:
+            end_date = datetime.now().strftime("%Y-%m-%d")
+        if start_date is None:
+            start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+
+        url = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+        params = {
+            "reportName": "RPT_BLOCK_TRADEINFOR",
+            "columns": "ALL",
+            "source": "WEB",
+            "client": "WEB",
+            "sortColumns": "TRADE_DATE",
+            "sortTypes": "-1",
+            "pageNumber": 1,
+            "pageSize": page_size,
+            "filter": f"(TRADE_DATE>='{start_date}')(TRADE_DATE<='{end_date}')",
+        }
+        data = self._request(url, params)
+        if not data or "result" not in data or not data["result"]:
+            return pd.DataFrame()
+
+        records = data["result"].get("data", [])
+        if not records:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(records)
+        col_map = {
+            "TRADE_DATE": "trade_date",
+            "SECURITY_CODE": "stock_code",
+            "SECURITY_NAME_ABBR": "stock_name",
+            "CLOSE_PRICE": "close_price",
+            "DEAL_PRICE": "deal_price",        # 成交价
+            "PREMIUM_RATIO": "premium_pct",     # 溢价率%（负=折价）
+            "DEAL_AMOUNT": "deal_amount",       # 成交额(元)
+            "DEAL_VOLUME": "deal_volume",       # 成交量(股)
+            "BUYER_NAME": "buyer",              # 买方
+            "SELLER_NAME": "seller",            # 卖方
+            "CHANGE_RATE_1DAYS": "next_1d_pct",   # 次日涨幅
+            "CHANGE_RATE_5DAYS": "next_5d_pct",   # 5日涨幅
+            "CHANGE_RATE_10DAYS": "next_10d_pct",
+            "CHANGE_RATE_20DAYS": "next_20d_pct",
+            "D1_CLOSE_ADJCHRATE": "adj_next_1d",
+        }
+        df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+        return df
+
+    # ====================== 股东减持/增持公告 ======================
+
+    def get_shareholder_changes(self, change_type: str = "减持",
+                                 page_size: int = 200) -> pd.DataFrame:
+        """
+        获取重要股东增减持数据
+        change_type: '减持' / '增持'
+        """
+        url = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+
+        if change_type == "减持":
+            report = "RPT_SHARE_REDUCE"
+        else:
+            report = "RPT_SHARE_INCREASE"
+
+        params = {
+            "reportName": report,
+            "columns": "ALL",
+            "source": "WEB",
+            "client": "WEB",
+            "sortColumns": "END_DATE",
+            "sortTypes": "-1",
+            "pageNumber": 1,
+            "pageSize": page_size,
+        }
+        data = self._request(url, params)
+        if not data or "result" not in data or not data["result"]:
+            return pd.DataFrame()
+
+        records = data["result"].get("data", [])
+        if not records:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(records)
+        col_map = {
+            "SECURITY_CODE": "stock_code",
+            "SECURITY_NAME_ABBR": "stock_name",
+            "END_DATE": "end_date",               # 减持截止日
+            "START_DATE": "start_date",            # 减持起始日
+            "CHANGE_SHARES_RATIO": "change_ratio", # 变动比例%
+            "HOLDER_NAME": "holder_name",          # 股东名
+            "HOLDER_TYPE": "holder_type",          # 高管/股东
+            "AVG_PRICE": "avg_price",              # 均价
+            "CHANGE_AMOUNT": "change_amount",      # 变动金额
+            "CLOSE_PRICE_BEFORE": "price_before",
+            "CLOSE_PRICE_AFTER": "price_after",
+        }
+        df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+        return df
+
+    # ====================== 融资融券数据 ======================
+
+    def get_margin_data_market(self) -> pd.DataFrame:
+        """获取全市场融资融券汇总数据"""
+        url = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+        params = {
+            "reportName": "RPTA_WEB_RZRQ_GGMX",
+            "columns": "ALL",
+            "source": "WEB",
+            "client": "WEB",
+            "sortColumns": "TRADE_DATE",
+            "sortTypes": "-1",
+            "pageNumber": 1,
+            "pageSize": 30,
+        }
+        data = self._request(url, params)
+        if not data or "result" not in data or not data["result"]:
+            return pd.DataFrame()
+        records = data["result"].get("data", [])
+        return pd.DataFrame(records) if records else pd.DataFrame()
+
+    def get_margin_data_stock(self, stock_code: str = None,
+                               page_size: int = 200) -> pd.DataFrame:
+        """获取个股融资融券明细"""
+        url = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+        params = {
+            "reportName": "RPTA_WEB_RZRQ_GGMX",
+            "columns": "ALL",
+            "source": "WEB",
+            "client": "WEB",
+            "sortColumns": "TRADE_DATE",
+            "sortTypes": "-1",
+            "pageNumber": 1,
+            "pageSize": page_size,
+        }
+        if stock_code:
+            params["filter"] = f'(SECURITY_CODE="{stock_code}")'
+
+        data = self._request(url, params)
+        if not data or "result" not in data or not data["result"]:
+            return pd.DataFrame()
+
+        records = data["result"].get("data", [])
+        if not records:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(records)
+        col_map = {
+            "TRADE_DATE": "trade_date",
+            "SECURITY_CODE": "stock_code",
+            "SECURITY_NAME_ABBR": "stock_name",
+            "RZYE": "rz_balance",         # 融资余额
+            "RZMRE": "rz_buy",            # 融资买入额
+            "RZCHE": "rz_repay",          # 融资偿还额
+            "RQYE": "rq_balance",         # 融券余额(元)
+            "RQYL": "rq_volume",          # 融券余量(股)
+            "RQMCL": "rq_sell_volume",    # 融券卖出量
+            "RQCHL": "rq_return_volume",  # 融券偿还量
+            "RZRQYE": "total_balance",    # 融资融券余额
+        }
+        df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+        return df
+
+    # ====================== 融资融券变动排名 ======================
+
+    def get_
