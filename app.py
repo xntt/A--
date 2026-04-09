@@ -280,16 +280,25 @@ elif page == "🚀 全扫描":
         c6.metric("做多", n5l)
 
         for a in results.get("m1", {}).get("alerts", [])[:5]:
-            alert_box(emoji(a["level"]) + " " + a["name"] + " 量比" + str(a["vol_ratio"]) + "x", a["level"])
+            msg = emoji(a["level"]) + " " + a["name"] + " 量比" + str(a["vol_ratio"]) + "x"
+            alert_box(msg, a["level"])
 
         for a in results.get("m2", {}).get("alerts", [])[:5]:
-            alert_box(emoji(a["level"]) + " 【" + a["alias"] + "】买入 " + a["name"], a["level"])
+            msg = emoji(a["level"]) + " 【" + a["alias"] + "】买入 " + a["name"]
+            alert_box(msg, a["level"])
 
         for a in results.get("m3", {}).get("alerts", [])[:5]:
-            alert_box(emoji(a["level"]) + " " + str(a["name"]) + " 折价" + str(a["discount"]) + "% 次日+" + str(a["next1d"]) + "%", a["level"])
+            msg = emoji(a["level"]) + " " + str(a["name"]) + " 折价" + str(a["discount"]) + "% 次日+" + str(a["next1d"]) + "%"
+            alert_box(msg, a["level"])
 
         for a in results.get("m4", {}).get("alerts", [])[:5]:
-            alert_box(emoji(a["level"]) + " " + a["name"] + " 减持后跌" + str(a["post_drop"]) + "%", a["level"])
+            msg = emoji(a["level"]) + " " + a["name"] + " 减持后跌" + str(a["post_drop"]) + "%"
+            alert_box(msg, a["level"])
 
         for a in results.get("m5", {}).get("short", [])[:3]:
-            alert_box(emoji(a["level"]) + " " + a["name"] + " 融券暴增"
+            msg = emoji(a["level"]) + " " + a["name"] + " 融券暴增" + str(a["spike_ratio"]) + "倍"
+            alert_box(msg, a["level"])
+
+        for a in results.get("m5", {}).get("long", [])[:3]:
+            msg = emoji(a["level"]) + " " + a["name"] + " 融资暴增" + str(a["spike_ratio"]) + "倍"
+            alert_box(msg, a["level"])
