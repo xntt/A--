@@ -530,4 +530,90 @@ class EastMoneyAPI:
                 "name": str(s.get("name", "")),
                 "title": "股价异动（系统自动标记，涨幅" + str(round(s.get("pct", 0), 1)) + "%）",
             })
-        self._log("OK announce_
+        self._log("OK announce_backup: " + str(len(rows)))
+        return pd.DataFrame(rows)
+
+    def _norm_announce(self, df):
+        cmap = {}
+        for c in df.columns:
+            cs = str(c).strip()
+            if "代码" in cs:
+                cmap[c] = "code"
+            elif "名称" in cs or "简称" in cs:
+                cmap[c] = "name"
+            elif "日期" in cs or "时间" in cs:
+                cmap[c] = "ann_date"
+            elif "标题" in cs or "公告" in cs or "内容" in cs:
+                cmap[c] = "title"
+        df = df.rename(columns=cmap)
+        if "code" in df.columns:
+            df["code"] = df["code"].astype(str).str.zfill(6)
+        if "ann_date" not in df.columns:
+            df["ann_date"] = datetime.now().strftime("%Y-%m-%d")
+        if "title" not in df.columns:
+            df["title"] = ""
+        return df
+
+    # ═══════════ 10. 涨停池 ═══════════
+
+    def get_limit_up(self, date=None):
+        stocks = self.get_all_stocks()
+        if stocks.empty:
+            return pd.DataFrame()
+        stocks["pct"] = pd.to_numeric(stocks["pct"], errors="coerce")
+        limit = stocks[stocks["pct"] >= 9.5].copy()
+        limit = limit.rename(columns={
+            "code": "code", "name": "name",
+            "price": "close", "pct": "pct",
+            "turnover": "turnover",
+        })
+        limit["first_time"] = ""
+        limit["last_time"] = ""
+        limit["limit_days"] = 1
+        limit["open_times"] = 0
+        limit["industry"] = ""
+        limit["trade_date"] = datetime.now().strftime("%Y-%m-%d")
+        self._log("OK limitup: " + str(len(limit)))
+        return limit
+
+    # ═══════════ 诊断 ═══════════
+
+    def run_diagnostics(self):
+        self.clear_debug_log()
+        results = {}
+
+        df = self.get_kline("600519", 5)
+        results["K线(茅台)"] = "OK " + str(len(df)) + "行" if not df.empty else "FAIL"
+
+        df = self.get_all_stocks()
+        results["全A股"] = "OK " + str(len(df)) + "只" if not df.empty else "FAIL"
+
+        df = self.get_sector_flow("industry", 10)
+        results["行业板块"] = "OK " + str(len(df)) + "个" if not df.empty else "FAIL"
+
+        df = self.get_sector_flow("concept", 10)
+        results["概念板块"] = "OK " + str(len(df)) + "个" if not df.empty else "FAIL"
+
+        df = self.get_dragon_tiger(size=10)
+        results["龙虎榜"] = "OK " + str(len(df)) + "条" if not df.empty else "FAIL"
+
+        df = self.get_block_trades(days=30, size=10)
+        results["大宗交易"] = "OK " + str(len(df)) + "条" if not df.empty else "FAIL"
+
+        df = self.get_holder_changes("减持", size=10)
+        results["股东减持"] = "OK " + str(len(df)) + "条" if not df.empty else "FAIL"
+
+        df = self.get_margin_ranking(size=10)
+        results["融资融券"] = "OK " + str(len(df)) + "条" if not df.empty else "FAIL"
+
+        df = self.get_announcements(days=30, size=10)
+        results["公告"] = "OK " + str(len(df)) + "条" if not df.empty else "FAIL"
+
+        df = self.get_limit_up()
+        results["涨停池"] = "OK " + str(len(df)) + "条" if not df.empty else "FAIL"
+
+        return results
+
+
+# 这一行必须在类外面，文件最底部
+api = EastMoneyAPI()
